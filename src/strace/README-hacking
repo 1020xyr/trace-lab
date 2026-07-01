@@ -1,0 +1,64 @@
+# Hacking on strace
+
+This file provides a brief overview for developers working on strace itself.
+
+## Getting Started
+
+If you're building from git (not a release tarball):
+
+1. See [INSTALL-git.md](INSTALL-git.md) for bootstrap requirements
+2. See [CONTRIBUTING.md](CONTRIBUTING.md) for code style, commit message format, and workflow
+3. See [doc/README.md](doc/README.md) for the complete documentation index
+
+## Quick Links for Contributors
+
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — How to contribute: code style, commit messages, testing, submission
+- **[doc/COMMIT-MESSAGES.md](doc/COMMIT-MESSAGES.md)** — Commit message format (strict requirements for ChangeLog generation)
+- **[doc/HOWTO_ADD_SYSCALL.md](doc/HOWTO_ADD_SYSCALL.md)** — Adding syscall decoders (most common task)
+- **[doc/HOWTO_TEST.md](doc/HOWTO_TEST.md)** — Writing and running tests
+- **[doc/README.md](doc/README.md)** — Full documentation index
+
+## Commit Messages
+
+**Important**: Commit messages must follow a strict format for automated
+ChangeLog generation. The ChangeLog file is generated from commit messages
+at `make dist` time — do not edit it manually.
+
+See [doc/COMMIT-MESSAGES.md](doc/COMMIT-MESSAGES.md) for the required format and examples.
+
+## Code Style
+
+strace follows Linux kernel coding style with these exceptions:
+
+- **No C++ style comments** — Use `/* */` exclusively; `//` is not allowed
+- **Designated initializers** — Strong preference for designated initializers in struct initialization
+- **Static const arrays** — Prefer static const arrays for xlat translation tables
+- **Include guards** — Use traditional `#ifndef` include guards, not `#pragma once`
+
+Running `scripts/checkpatch.pl` from the Linux kernel is optional but preferred:
+- https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/scripts/checkpatch.pl
+
+For the full Linux kernel coding style (which strace follows except for the above):
+- https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/Documentation/process/coding-style.rst
+
+## Documentation Requirements
+
+All changes must be documented:
+
+- **NEWS file** — Update for all user-visible changes
+- **Man page** — Update `doc/strace.1.in` for interface changes
+- **Help output** — New options must appear in both `-h` output and the man page
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete checklist.
+
+## Architecture
+
+For understanding strace internals:
+
+- **[doc/INTERNALS.md](doc/INTERNALS.md)** — Architecture overview: ptrace, event loop, syscall dispatch
+- **[doc/DECODER_API.md](doc/DECODER_API.md)** — Print helper reference
+- **[doc/GLOSSARY.md](doc/GLOSSARY.md)** — Project terminology (tcb, xlat, SEN, MPERS, etc.)
+
+## Full Documentation Index
+
+See [doc/README.md](doc/README.md) for the complete documentation index organized by topic.

@@ -1,0 +1,49 @@
+# This job listens for new releases and will build the appropriate artifacts
+# and upload them to the release.
+
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Skip uploading artifacts (for testing the workflow)'
+        type: boolean
+        default: true
+
+jobs:
+  build-upload:
+    name: build-upload (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Only the x86_64 runner builds the arch-independent assets
+          - runner: ubuntu-latest
+            build_shared: "1"
+          - runner: ubuntu-24.04-arm
+            build_shared: "0"
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      # For flakehub cache
+      id-token: write
+      # For artifact upload
+      contents: write
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: true
+    - uses: DeterminateSystems/nix-installer-action@v17
+      with:
+        determinate: true
+    - uses: DeterminateSystems/flakehub-cache-action@v2
+    - name: Build artifacts
+      run: nix develop --command bash -c "OUT=./assets BUILD_SHARED_ASSETS=${{ matrix.build_shared }} ./scripts/create-assets.sh"
+
+    - name: Upload artifacts
+      if: ${{ !inputs.dry_run }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release upload ${{ github.ref_name }} ./assets/*

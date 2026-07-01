@@ -1,0 +1,32 @@
+#!/bin/sh
+#
+# Check restart_syscall decoding.
+#
+# Copyright (c) 2015-2026 The strace developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+. "${srcdir=.}/init.sh"
+
+run_prog ../sleep 0
+
+../set_ptracer_any ../sleep 2 > /dev/null &
+tracee_pid=$!
+
+../sleep 1
+
+run_strace -qq -a14 -e trace=restart_syscall,exit_group -p $tracee_pid
+
+# On mips the interrupted syscall number is not available on attach.
+case "$STRACE_ARCH" in
+mips)	syscall='system call' ;;
+*)	syscall=nanosleep ;;
+esac
+
+cat > "$EXP" <<__EOF__
+restart_syscall(<... resuming interrupted $syscall ...>) = 0
+exit_group(0) = ?
+__EOF__
+
+match_diff "$LOG" "$EXP"

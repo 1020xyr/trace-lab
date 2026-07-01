@@ -1,0 +1,83 @@
+# bash completion of bpftrace(8)
+
+_bpftrace_filedir()
+{
+  # bash-completion 2.11-1091-g6e8a1546bde2 rename _filedir to _comp_compgen_filedir
+  if [[ ${BASH_COMPLETION_VERSINFO[0]} == 2 ]] && \
+     [[ ${BASH_COMPLETION_VERSINFO[1]} > 11 ]]; then
+    _comp_compgen_filedir "${@}"
+  else
+    _filedir "${@}"
+  fi
+}
+
+_bpftrace()
+{
+  local cur prev words argument
+
+  _init_completion -- "$@" || return
+
+  local all_args='-B -f -o -e -h --help -I --include -l -p --dwarf-pid -c
+                  --usdt-file-activation --unsafe -q --quiet
+                  --info -k --warnings -V --version --no-warnings -v --dry-run
+                  --mode --test --bench --probe-filter --traceable-functions
+                  -d --debug --debuginfo --emit-elf --emit-llvm'
+
+  if [[ $cur == -* ]]; then
+    argument=$cur
+  fi
+
+  case ${prev} in
+  -B)
+    COMPREPLY=( $(compgen -W "line full none" -- ${cur}) )
+    return 0
+    ;;
+  -f)
+    COMPREPLY=( $(compgen -W "text json" -- ${cur}) )
+    return 0
+    ;;
+  -c)
+    COMPREPLY=( $(compgen -c -- ${cur}) )
+    return 0
+    ;;
+  -o | --include | --emit-elf | --emit-llvm | --traceable-functions | --debuginfo)
+    _bpftrace_filedir
+    return 0
+    ;;
+  --mode)
+    COMPREPLY=( $(compgen -W "codegen compiler-bench bench test format" -- ${cur}) )
+    return 0
+    ;;
+  -I)
+    _bpftrace_filedir -d
+    return 0
+    ;;
+  -p | --dwarf-pid)
+    local PIDS=$(cd /proc && echo [0-9]*)
+    COMPREPLY=( $(compgen -W "$PIDS" -- ${cur}) )
+    return 0
+    ;;
+  -d | --debug)
+    debug_stage=( all ast types codegen codegen-opt dis parse libbpf verifier )
+    COMPREPLY=( $(compgen -W "${debug_stage[*]}" -- ${cur}) )
+    return 0
+    ;;
+  -h | --help | -V | --version | --info)
+    return
+    ;;
+  esac
+
+  # bpftrace directly specifies the script, like: bpftrace a.bt
+  if [[ ! ${argument} ]]; then
+    _bpftrace_filedir
+  else
+    # Just drop -e,--probe-filter content completion, because it's very complex.
+    if ([[ ${cur} == -* ]] || [[ -z ${cur} ]]) &&
+       [[ ! " -e --probe-filter " =~ " ${prev} " ]]; then
+      COMPREPLY=( $(compgen -W "${all_args}" -- ${cur}) )
+      return
+    fi
+  fi
+}
+
+complete -F _bpftrace bpftrace

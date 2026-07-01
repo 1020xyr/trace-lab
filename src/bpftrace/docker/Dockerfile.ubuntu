@@ -1,0 +1,41 @@
+# This Dockerfile is used to both document and test building bpftrace on the
+# development version of ubuntu. We attempt to catch bugs as early as possible
+# which is why we are using devel.
+
+FROM ubuntu:devel
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    asciidoctor \
+    binutils-dev \
+    bison \
+    build-essential \
+    clang \
+    cmake \
+    flex \
+    libbpf-dev \
+    libbpfcc-dev \
+    libcereal-dev \
+    libdw-dev \
+    libelf-dev \
+    libiberty-dev \
+    libpcap-dev \
+    llvm-dev \
+    libclang-dev \
+    libclang-cpp-dev \
+    linux-tools-common \
+    pahole \
+    xxd \
+    zip \
+    zlib1g-dev
+
+COPY . /src
+WORKDIR /src
+
+# Use CMAKE_BUILD_TYPE=Release if you don't plan on developing bpftrace
+# We set USE_SYSTEM_LIBBPF=On to test that bpftrace can build with system libbpf
+# (i.e. not using libbpf from the submodule)
+RUN cmake -B /build -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Debug -DUSE_SYSTEM_LIBBPF=On
+RUN make -C /build -j$(nproc)
+
+ENTRYPOINT ["/build/src/bpftrace"]

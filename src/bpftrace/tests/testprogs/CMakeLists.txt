@@ -1,0 +1,177 @@
+set_property(GLOBAL APPEND_STRING PROPERTY testprog_cflags "-g -O0")
+
+# Check and add CFLAG to testprog_cflags
+include(CheckCCompilerFlag)
+function(test_and_add_testprog_cflag flag)
+  # We need unique variable name since check_c_compiler_flag caches results
+  string(MAKE_C_IDENTIFIER "HAVE_FLAG_${flag}" flag_var)
+  check_c_compiler_flag("${flag}" ${flag_var})
+  if(${${flag_var}})
+    set_property(GLOBAL APPEND_STRING PROPERTY testprog_cflags " ${flag}")
+  else()
+    message(STATUS "${CMAKE_C_COMPILER} does not support ${flag}")
+  endif()
+endfunction()
+
+test_and_add_testprog_cflag("-fno-omit-frame-pointer")
+test_and_add_testprog_cflag("-mno-omit-leaf-frame-pointer")
+get_property(testprog_cflags GLOBAL PROPERTY testprog_cflags)
+
+file(GLOB testprog_sources CONFIGURE_DEPENDS *.c *.cpp)
+set(testprogtargets "")
+function(testprog_compile is_pie)
+  foreach(testprog_source ${testprog_sources})
+    get_filename_component(testprog_name ${testprog_source} NAME_WE)
+    set(extra_cflags "")
+    set(ldflags "-no-pie")
+    if(is_pie)
+      set(testprog_name "${testprog_name}-pie")
+      set(extra_cflags "-fpie")
+      set(ldflags "-pie")
+    endif()
+    add_executable(${testprog_name} ${testprog_source})
+    set_target_properties(${testprog_name}
+      PROPERTIES
+        LINK_SEARCH_START_STATIC FALSE
+        LINK_SEARCH_END_STATIC FALSE
+        COMPILE_FLAGS "${testprog_cflags} ${extra_cflags}"
+        LINK_FLAGS "${ldflags}")
+    target_include_directories(${testprog_name} PRIVATE ${CMAKE_SOURCE_DIR}/tests/include)
+    list(APPEND testprogtargets ${testprog_name})
+  endforeach()
+endfunction()
+# Compile all test programs into PIE and non-PIE ELF executables.
+testprog_compile(FALSE)
+testprog_compile(TRUE)
+
+# uprobe_nofp must be compiled without frame pointers to validate that
+# DWARF-based stack unwinding can produce a full stack trace.
+foreach(prog uprobe_nofp uprobe_nofp-pie)
+  set_target_properties(${prog} PROPERTIES COMPILE_FLAGS "-g -O1 -fomit-frame-pointer -fno-optimize-sibling-calls")
+endforeach()
+
+find_program(GO_EXECUTABLE go)
+if(GO_EXECUTABLE)
+  file(GLOB testprog_go_sources CONFIGURE_DEPENDS *.go)
+  foreach(testprog_source ${testprog_go_sources})
+    get_filename_component(testprog_name ${testprog_source} NAME_WE)
+    add_custom_command(
+      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${testprog_name}
+      COMMAND ${GO_EXECUTABLE} build -o ${CMAKE_CURRENT_BINARY_DIR}/${testprog_name} ${testprog_source}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      DEPENDS ${testprog_source}
+    )
+    list(APPEND testprogtargets ${testprog_name})
+  endforeach()
+endif()
+
+find_program(RUSTC_EXECUTABLE rustc)
+if(RUSTC_EXECUTABLE)
+  file(GLOB testprog_rust_sources CONFIGURE_DEPENDS *.rs)
+  foreach(testprog_source ${testprog_rust_sources})
+    get_filename_component(testprog_name ${testprog_source} NAME_WE)
+    add_custom_command(
+      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${testprog_name}
+      COMMAND ${RUSTC_EXECUTABLE} -C symbol_mangling_version=v0 -o ${CMAKE_CURRENT_BINARY_DIR}/${testprog_name} ${testprog_source}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      DEPENDS ${testprog_source}
+    )
+    list(APPEND testprogtargets ${testprog_name})
+  endforeach()
+endif()
+
+# Generate a flat binary containing only function `main` from false.c; it's used by runtime tests
+# to verify that arbitrary files containing executable code can be uprobed, not just ELF binaries.
+find_program(LLVM_OBJCOPY llvm-objcopy REQUIRED)
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/false.bin
+  COMMAND ${CMAKE_C_COMPILER} -c ${CMAKE_CURRENT_SOURCE_DIR}/false.c -o ${CMAKE_CURRENT_BINARY_DIR}/false.o
+  COMMAND ${LLVM_OBJCOPY} -S --only-section=.text --keep-symbol=main -O binary ${CMAKE_CURRENT_BINARY_DIR}/false.o ${CMAKE_CURRENT_BINARY_DIR}/false.bin
+  COMMAND ${CMAKE_COMMAND} -E rm -f ${CMAKE_CURRENT_BINARY_DIR}/false.o
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  DEPENDS false.c
+)
+list(APPEND testprogtargets false.bin)
+
+# Create a ZIP file containing one of the test programs. Used to test probing files inside archives.
+find_PROGRAM(ZIP zip REQUIRED)
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/archive.zip
+  COMMAND ${ZIP} -0 -j ${CMAKE_CURRENT_BINARY_DIR}/archive.zip ${CMAKE_CURRENT_BINARY_DIR}/true
+  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/true
+)
+list(APPEND testprogtargets archive.zip)
+
+# Make debug subdirs to test parsing of external DWARF debug formats.
+set(EXTERNAL_DEBUG_DIR ${CMAKE_CURRENT_BINARY_DIR}/external_debug)
+file(MAKE_DIRECTORY
+  ${EXTERNAL_DEBUG_DIR}
+  ${EXTERNAL_DEBUG_DIR}/dwo
+  ${EXTERNAL_DEBUG_DIR}/dwp
+  ${CMAKE_CURRENT_BINARY_DIR}/.debug
+)
+
+# Create a stripped binary with a separate .debug file, placed in a subdir; used to verify
+# searching and parsing of external debuginfo via --debuginfo option.
+add_custom_command(
+  OUTPUT 
+    ${CMAKE_CURRENT_BINARY_DIR}/uprobe_test-stripped
+    ${EXTERNAL_DEBUG_DIR}/uprobe_test-stripped.debug
+  COMMAND ${LLVM_OBJCOPY} --only-keep-debug $<TARGET_FILE:uprobe_test> ${EXTERNAL_DEBUG_DIR}/uprobe_test-stripped.debug
+  COMMAND ${LLVM_OBJCOPY} --strip-debug $<TARGET_FILE:uprobe_test> ${CMAKE_CURRENT_BINARY_DIR}/uprobe_test-stripped
+  DEPENDS uprobe_test
+)
+list(APPEND testprogtargets
+  ${CMAKE_CURRENT_BINARY_DIR}/uprobe_test-stripped
+  ${EXTERNAL_DEBUG_DIR}/uprobe_test-stripped.debug)
+
+# Second stripped binary (distinct build-id), with its .debug placed in the standard ./.debug/ subdir;
+# used to verify default build-id-based lookup.
+add_custom_command(
+  OUTPUT 
+    ${CMAKE_CURRENT_BINARY_DIR}/uprobe_separate_debug-stripped
+    ${CMAKE_CURRENT_BINARY_DIR}/.debug/uprobe_separate_debug-stripped.debug
+  COMMAND ${LLVM_OBJCOPY} --only-keep-debug $<TARGET_FILE:uprobe_separate_debug> ${CMAKE_CURRENT_BINARY_DIR}/.debug/uprobe_separate_debug-stripped.debug
+  COMMAND ${LLVM_OBJCOPY} --strip-debug $<TARGET_FILE:uprobe_separate_debug> ${CMAKE_CURRENT_BINARY_DIR}/uprobe_separate_debug-stripped
+  COMMAND ${LLVM_OBJCOPY}
+    --add-gnu-debuglink=${CMAKE_CURRENT_BINARY_DIR}/.debug/uprobe_separate_debug-stripped.debug
+    ${CMAKE_CURRENT_BINARY_DIR}/uprobe_separate_debug-stripped
+  DEPENDS uprobe_separate_debug
+)
+list(APPEND testprogtargets
+  ${CMAKE_CURRENT_BINARY_DIR}/uprobe_separate_debug-stripped
+  ${CMAKE_CURRENT_BINARY_DIR}/.debug/uprobe_separate_debug-stripped.debug)
+
+# Build a binary with split DWARF (.dwo files) to verify parsing of the split debug info format.
+add_custom_command(
+  OUTPUT
+    ${EXTERNAL_DEBUG_DIR}/dwo/uprobe_test-split
+    ${EXTERNAL_DEBUG_DIR}/dwo/uprobe_test-split-uprobe_test.dwo
+  COMMAND ${CMAKE_C_COMPILER} -g -O0 -gsplit-dwarf ${CMAKE_CURRENT_SOURCE_DIR}/uprobe_test.c -o ${EXTERNAL_DEBUG_DIR}/dwo/uprobe_test-split
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/uprobe_test.c
+)
+list(APPEND testprogtargets ${EXTERNAL_DEBUG_DIR}/dwo/uprobe_test-split)
+
+# Build a binary with split debuginfo and bundle the .dwo files into a DWARF Package (.dwp)
+# archive; to verify parsing of the packaged format.
+find_program(LLVM_DWP llvm-dwp REQUIRED)
+add_custom_command(
+  OUTPUT
+    ${EXTERNAL_DEBUG_DIR}/dwp/uprobe_test-split
+    ${EXTERNAL_DEBUG_DIR}/dwp/uprobe_test-split.dwp
+  COMMAND ${CMAKE_C_COMPILER} -g -O0 -gsplit-dwarf ${CMAKE_CURRENT_SOURCE_DIR}/uprobe_test.c -o ${EXTERNAL_DEBUG_DIR}/dwp/uprobe_test-split
+  COMMAND ${LLVM_DWP} -e ${EXTERNAL_DEBUG_DIR}/dwp/uprobe_test-split -o ${EXTERNAL_DEBUG_DIR}/dwp/uprobe_test-split.dwp
+  COMMAND ${CMAKE_COMMAND} -E rm -f ${EXTERNAL_DEBUG_DIR}/dwp/*.dwo
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/uprobe_test.c
+)
+list(APPEND testprogtargets
+  ${EXTERNAL_DEBUG_DIR}/dwp/uprobe_test-split
+  ${EXTERNAL_DEBUG_DIR}/dwp/uprobe_test-split.dwp)
+
+add_custom_target(testprogs ALL DEPENDS ${testprogtargets})
+
+foreach(prog usdt_lib usdt_lib-pie)
+  target_include_directories(${prog} PRIVATE ${CMAKE_SOURCE_DIR}/tests/testlibs/)
+  target_compile_options(${prog} PRIVATE -fPIC)
+  target_link_libraries(${prog} usdt_tp)
+endforeach()

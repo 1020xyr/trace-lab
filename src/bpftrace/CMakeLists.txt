@@ -1,0 +1,237 @@
+cmake_minimum_required(VERSION 3.14)
+project(bpftrace)
+
+cmake_policy(SET CMP0057 NEW)
+
+# bpftrace version number components.
+set(bpftrace_VERSION_MAJOR 0)
+set(bpftrace_VERSION_MINOR 26)
+set(bpftrace_VERSION_PATCH 0)
+
+include(GNUInstallDirs)
+
+set(WARNINGS_AS_ERRORS OFF CACHE BOOL "Build with -Werror")
+set(HARDENED_STDLIB OFF CACHE BOOL "Enable hardened definitions for standard library (for development use only)")
+set(STATIC_LINKING OFF CACHE BOOL "Build bpftrace as a statically linked executable")
+
+set(BUILD_ASAN OFF CACHE BOOL "Build bpftrace with -fsanitize=address")
+set(BUILD_UBSAN OFF CACHE BOOL "Build bpftrace with -fsanitize=undefined")
+set(ENABLE_MAN ON CACHE BOOL "Build man pages")
+set(BUILD_TESTING ON CACHE BOOL "Build test suite")
+set(ENABLE_SYSTEMD OFF CACHE BOOL "Enable systemd integration")
+set(KERNEL_HEADERS_DIR "" CACHE PATH "Hard-code kernel headers directory")
+set(SYSTEM_INCLUDE_PATHS "auto" CACHE STRING "Hard-code system include paths (colon separated, the default value \"auto\" queries clang at runtime)")
+set(USE_SYSTEM_LIBBPF OFF CACHE BOOL
+    "Use system libbpf instead of vendoring it from a submodule")
+
+set(ENABLE_SKB_OUTPUT ON CACHE BOOL "Enable skb_output, will include libpcap")
+
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+
+set (CMAKE_CXX_STANDARD 20)
+set (CMAKE_CXX_STANDARD_REQUIRED ON)
+set (CMAKE_CXX_EXTENSIONS OFF)
+
+add_compile_options("-Wall")
+add_compile_options("-Wextra")
+add_compile_options("-Werror=undef")
+add_compile_options("-Wpointer-arith")
+add_compile_options("-Wcast-align")
+add_compile_options("-Wwrite-strings")
+add_compile_options("-Wcast-qual")
+add_compile_options("-Wunreachable-code")
+add_compile_options("-Wdisabled-optimization")
+
+# libbpf has a standardized macro which requires partial initialization. In
+# general this is well-specified [1] and will zero-initialize (or run default
+# constructors) for non-specified fields, which is what we want. Therefore,
+# we disable this warning broadly and allow this syntax.
+# [1]: https://en.cppreference.com/w/cpp/language/aggregate_initialization.html
+add_compile_options("-Wno-missing-field-initializers")
+
+add_compile_definitions(
+  $<$<BOOL:${HARDENED_STDLIB}>:_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG>
+  $<$<BOOL:${HARDENED_STDLIB}>:_GLIBCXX_ASSERTIONS>
+  $<$<AND:$<BOOL:${HARDENED_STDLIB}>,$<CONFIG:Release>>:_FORTIFY_SOURCE=3>
+)
+
+add_compile_options($<$<BOOL:${WARNINGS_AS_ERRORS}>:-Werror>)
+
+# Clang compiler produces narrowing errors when calling BPF_LD_MAP_FD in the bcc library
+# Turning off them before bcc library fixes this
+add_compile_options($<$<CXX_COMPILER_ID:Clang>:-Wno-narrowing>)
+
+include_directories(${CMAKE_SOURCE_DIR}/src)
+include_directories(${CMAKE_BINARY_DIR}/src)
+include_directories(${CMAKE_BINARY_DIR})
+
+# Ninja buffers output so gcc/clang think it's not an interactive session.
+# Colors are useful for compiler errors so force the color
+add_compile_options(
+  $<$<AND:$<STREQUAL:${CMAKE_GENERATOR},Ninja>,$<CXX_COMPILER_ID:GNU>>:-fdiagnostics-color=always>
+  $<$<AND:$<STREQUAL:${CMAKE_GENERATOR},Ninja>,$<CXX_COMPILER_ID:Clang>>:-fcolor-diagnostics>
+)
+
+include(CTest)
+
+if(STATIC_LINKING)
+  set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+  set(CMAKE_LINK_SEARCH_START_STATIC TRUE)
+  set(CMAKE_LINK_SEARCH_END_STATIC TRUE)
+endif(STATIC_LINKING)
+
+set_property( GLOBAL PROPERTY FIND_LIBRARY_USE_LIB64_PATHS TRUE )
+
+include_directories(SYSTEM ${KERNEL_INCLUDE_DIRS})
+
+find_package(ZLIB REQUIRED)
+include_directories(SYSTEM ${ZLIB_INCLUDE_DIRS})
+
+find_package(LibBcc REQUIRED)
+include_directories(SYSTEM ${LIBBCC_INCLUDE_DIRS})
+
+find_package(LibBpf REQUIRED)
+include_directories(SYSTEM ${LIBBPF_INCLUDE_DIRS})
+if(USE_SYSTEM_LIBBPF)
+  message(WARNING "Using system libbpf, please ensure that the version is greater than or equal to the submodule")
+endif()
+
+find_package(LibElf REQUIRED)
+include_directories(SYSTEM ${LIBELF_INCLUDE_DIRS})
+
+find_package(LibCereal REQUIRED)
+include_directories(SYSTEM ${LIBCEREAL_INCLUDE_DIRS})
+
+
+include(CheckSymbolExists)
+set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+check_symbol_exists(name_to_handle_at "sys/types.h;sys/stat.h;fcntl.h" HAVE_NAME_TO_HANDLE_AT)
+set(CMAKE_REQUIRED_DEFINITIONS)
+
+# Newer libbfd requires zstd so let's find that first
+find_library(LIBZSTD_LIBRARIES
+  NAMES
+    zstd
+  PATHS
+    ENV LIBRARY_PATH
+    ENV LD_LIBRARY_PATH)
+find_package(LibBfd)
+find_package(LibOpcodes)
+find_package(LibDw)
+
+if(ENABLE_SKB_OUTPUT)
+  find_package(LibPcap)
+endif()
+
+if(ENABLE_SYSTEMD)
+  find_package(PkgConfig)
+  pkg_check_modules(libsystemd REQUIRED IMPORTED_TARGET libsystemd)
+endif()
+
+find_package(LibBlazesym)
+
+if(POLICY CMP0075)
+  cmake_policy(SET CMP0075 NEW)
+endif()
+
+if(${LIBBFD_FOUND} AND ${LIBOPCODES_FOUND})
+  set(HAVE_BFD_DISASM TRUE)
+endif()
+
+# Some users have multiple versions of llvm installed and would like to specify
+# a specific llvm version.
+if(${LLVM_REQUESTED_VERSION})
+  find_package(LLVM ${LLVM_REQUESTED_VERSION} REQUIRED)
+else()
+  find_package(LLVM REQUIRED)
+endif()
+
+set(MIN_LLVM_MAJOR 18)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  # We assume bpftrace is not being packaged when CMAKE_BUILD_TYPE=Debug.
+  # So allow building with any LLVM version. This is purely for developers.
+  # Packagers are highly discouraged from shipping bpftrace with untested LLVM
+  # releases.
+  set(MAX_LLVM_MAJOR 999)
+else()
+  set(MAX_LLVM_MAJOR 22)
+endif()
+
+if((${LLVM_VERSION_MAJOR} VERSION_LESS ${MIN_LLVM_MAJOR}) OR (${LLVM_VERSION_MAJOR} VERSION_GREATER ${MAX_LLVM_MAJOR}))
+  message(SEND_ERROR "Unsupported LLVM version found via ${LLVM_INCLUDE_DIRS}: ${LLVM_VERSION_MAJOR}")
+  message(SEND_ERROR "Only versions between ${MIN_LLVM_MAJOR} and ${MAX_LLVM_MAJOR} are supported")
+  message(SEND_ERROR "Specify an LLVM major version using LLVM_REQUESTED_VERSION=<major version>")
+endif()
+
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}: ${LLVM_CMAKE_DIR}")
+include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
+
+string(REGEX REPLACE "-rc[0-9]+" "" CLANG_VERSION ${LLVM_PACKAGE_VERSION})
+
+find_package(Clang ${CLANG_VERSION} REQUIRED)
+include_directories(SYSTEM ${CLANG_INCLUDE_DIRS})
+
+# DWARF-based user-space stack unwinding requires x86_64 and LLVM >= 21
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64" AND
+   LLVM_VERSION_MAJOR GREATER_EQUAL 21)
+  set(HAVE_DW_UNWIND TRUE)
+endif()
+
+# BPFtrace compile definitions
+
+set(BPFTRACE_FLAGS)
+
+if(HAVE_NAME_TO_HANDLE_AT)
+  set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_NAME_TO_HANDLE_AT=1)
+endif(HAVE_NAME_TO_HANDLE_AT)
+
+if(HAVE_BFD_DISASM)
+  set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_BFD_DISASM)
+  if(LIBBFD_INIT_DISASM_INFO_FOUR_ARGS_SIGNATURE)
+    set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" LIBBFD_INIT_DISASM_INFO_FOUR_ARGS_SIGNATURE)
+  endif(LIBBFD_INIT_DISASM_INFO_FOUR_ARGS_SIGNATURE)
+endif(HAVE_BFD_DISASM)
+
+if(LIBDW_FOUND)
+  set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_LIBDW)
+endif()
+
+if(LIBPCAP_FOUND)
+  set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_LIBPCAP)
+endif(LIBPCAP_FOUND)
+
+if(ENABLE_SYSTEMD)
+  set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_LIBSYSTEMD)
+endif()
+
+if(LIBBLAZESYM_FOUND)
+  set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_BLAZESYM)
+  include_directories(SYSTEM ${LIBBLAZESYM_INCLUDE_DIRS})
+endif()
+
+if(HAVE_DW_UNWIND)
+  set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_DW_UNWIND)
+endif()
+
+add_subdirectory(src)
+if (BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
+add_subdirectory(tools)
+if (ENABLE_MAN)
+  add_subdirectory(man)
+endif(ENABLE_MAN)
+
+set(BASH_COMPLETION_PATH ${CMAKE_CURRENT_SOURCE_DIR}/scripts/bash-completion/bpftrace)
+install(FILES ${BASH_COMPLETION_PATH} DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/bash-completion/completions)
+
+if(NOT TARGET uninstall)
+  configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CmakeUninstall.cmake.in"
+	"${CMAKE_CURRENT_BINARY_DIR}/CmakeUninstall.cmake"
+    IMMEDIATE @ONLY)
+
+  add_custom_target(uninstall
+	  COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/CmakeUninstall.cmake)
+endif()

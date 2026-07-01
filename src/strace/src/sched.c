@@ -1,0 +1,320 @@
+/*
+ * Copyright (c) 2004 Ulrich Drepper <drepper@redhat.com>
+ * Copyright (c) 2005 Roland McGrath <roland@redhat.com>
+ * Copyright (c) 2012-2015 Dmitry V. Levin <ldv@strace.io>
+ * Copyright (c) 2014-2026 The strace developers.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ */
+
+#include "defs.h"
+
+#include <linux/sched.h>
+#include <linux/sched/types.h>
+
+#include "xstring.h"
+#include "xlat/schedulers.h"
+#include "xlat/sched_flags.h"
+#include "xlat/sched_getattr_flags.h"
+
+/**
+ * Returns a string (pointing to a statically allocated buffer) if the policy
+ * can be decoded, and NULL otherwise.
+ */
+static const char *
+sprint_policy(const kernel_long_t policy)
+{
+	static char buf[sizeof("SCHED_RESET_ON_FORK|SCHED_DEADLINE")];
+	const char *policy_str;
+
+	if (policy < 0)
+		return NULL;
+
+	policy_str = xlookup(schedulers, policy & ~SCHED_RESET_ON_FORK);
+
+	if (policy & SCHED_RESET_ON_FORK) {
+		if (policy_str != NULL) {
+			xsprintf(buf, "SCHED_RESET_ON_FORK|%s", policy_str);
+		} else {
+			xsprintf(buf, "SCHED_RESET_ON_FORK|%#" PRI_klx,
+				 policy & ~SCHED_RESET_ON_FORK);
+		}
+
+		return buf;
+	}
+
+	return policy_str;
+}
+
+static void
+print_policy(const int policy)
+{
+	const char *policy_str = sprint_policy(policy);
+
+	print_xlat_ex((unsigned int) policy,
+		      policy_str ?: "SCHED_???",
+		      policy_str ? XLAT_STYLE_DEFAULT : PXF_DEFAULT_STR);
+}
+
+static void
+print_sched_param(struct tcb * const tcp, const kernel_ulong_t addr)
+{
+	struct strace_sched_param {
+		int sched_priority;
+	} param;
+
+	if (umove_or_printaddr(tcp, addr, &param))
+		return;
+
+	tprint_struct_begin();
+	PRINT_FIELD_D(param, sched_priority);
+	tprint_struct_end();
+}
+
+SYS_FUNC(sched_getscheduler)
+{
+	if (entering(tcp)) {
+		/* pid */
+		tprints_arg_name("pid");
+		printpid(tcp, tcp->u_arg[0], PT_TGID);
+	} else if (!syserror(tcp)) {
+		tcp->auxstr = sprint_policy(tcp->u_rval);
+		return RVAL_HEX | RVAL_STR;
+	}
+	return 0;
+}
+
+SYS_FUNC(sched_setscheduler)
+{
+	/* pid */
+	tprints_arg_name("pid");
+	printpid(tcp, tcp->u_arg[0], PT_TGID);
+
+	/* policy */
+	tprints_arg_next_name("policy");
+	print_policy(tcp->u_arg[1]);
+
+	/* param */
+	tprints_arg_next_name("param");
+	print_sched_param(tcp, tcp->u_arg[2]);
+
+	return RVAL_DECODED;
+}
+
+SYS_FUNC(sched_getparam)
+{
+	if (entering(tcp)) {
+		/* pid */
+		tprints_arg_name("pid");
+		printpid(tcp, tcp->u_arg[0], PT_TGID);
+	} else {
+		/* param */
+		tprints_arg_next_name("param");
+		print_sched_param(tcp, tcp->u_arg[1]);
+	}
+	return 0;
+}
+
+SYS_FUNC(sched_setparam)
+{
+	/* pid */
+	tprints_arg_name("pid");
+	printpid(tcp, tcp->u_arg[0], PT_TGID);
+
+	/* param */
+	tprints_arg_next_name("param");
+	print_sched_param(tcp, tcp->u_arg[1]);
+
+	return RVAL_DECODED;
+}
+
+SYS_FUNC(sched_get_priority_min)
+{
+	/* policy */
+	tprints_arg_name("policy");
+	printxval(schedulers, tcp->u_arg[0], "SCHED_???");
+
+	return RVAL_DECODED;
+}
+
+static int
+do_sched_rr_get_interval(struct tcb *const tcp,
+			 const print_obj_by_addr_fn print_ts)
+{
+	if (entering(tcp)) {
+		/* pid */
+		tprints_arg_name("pid");
+		printpid(tcp, tcp->u_arg[0], PT_TGID);
+	} else {
+		/* tp */
+		tprints_arg_next_name("tp");
+		if (syserror(tcp))
+			printaddr(tcp->u_arg[1]);
+		else
+			print_ts(tcp, tcp->u_arg[1]);
+	}
+	return 0;
+}
+
+#if HAVE_ARCH_TIME32_SYSCALLS
+SYS_FUNC(sched_rr_get_interval_time32)
+{
+	return do_sched_rr_get_interval(tcp, print_timespec32);
+}
+#endif
+
+SYS_FUNC(sched_rr_get_interval_time64)
+{
+	return do_sched_rr_get_interval(tcp, print_timespec64);
+}
+
+static void
+print_sched_attr(struct tcb *const tcp, const kernel_ulong_t addr,
+		 unsigned int usize)
+{
+	struct sched_attr attr = {};
+	unsigned int size;
+	bool is_set = false;
+
+	if (usize) {
+		/* called from sched_getattr */
+		size = usize <= sizeof(attr) ? usize : (unsigned) sizeof(attr);
+		if (umoven_or_printaddr(tcp, addr, size, &attr))
+			return;
+		/* the number of bytes written by the kernel */
+		size = attr.size;
+	} else {
+		/* called from sched_setattr */
+		is_set = true;
+
+		if (umove_or_printaddr(tcp, addr, &attr.size))
+			return;
+		usize = attr.size;
+		if (!usize)
+			usize = SCHED_ATTR_SIZE_VER0;
+		size = usize <= sizeof(attr) ? usize : (unsigned) sizeof(attr);
+		if (size >= SCHED_ATTR_SIZE_VER0) {
+			if (umoven_or_printaddr(tcp, addr, size, &attr))
+				return;
+		}
+	}
+
+	tprint_struct_begin();
+	PRINT_FIELD_U(attr, size);
+
+	if (size < SCHED_ATTR_SIZE_VER0)
+		goto end;
+
+	if (!is_set || (int)attr.sched_policy < 0 || !(attr.sched_flags & (SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS))) {
+		tprint_struct_next();
+		PRINT_FIELD_XVAL(attr, sched_policy, schedulers,
+				 "SCHED_???");
+	}
+	tprint_struct_next();
+	PRINT_FIELD_FLAGS(attr, sched_flags, sched_flags, "SCHED_FLAG_???");
+
+
+	if (!is_set || !(attr.sched_flags & SCHED_FLAG_KEEP_PARAMS)) {
+		tprint_struct_next();
+		PRINT_FIELD_D(attr, sched_nice);
+		tprint_struct_next();
+		PRINT_FIELD_U(attr, sched_priority);
+		tprint_struct_next();
+		PRINT_FIELD_U(attr, sched_runtime);
+		tprint_struct_next();
+		PRINT_FIELD_U(attr, sched_deadline);
+		tprint_struct_next();
+		PRINT_FIELD_U(attr, sched_period);
+	}
+
+	if (size < SCHED_ATTR_SIZE_VER1)
+		goto end;
+
+	tprint_struct_next();
+	PRINT_FIELD_U(attr, sched_util_min);
+	tprint_struct_next();
+	PRINT_FIELD_U(attr, sched_util_max);
+
+end:
+	if ((is_set ? usize : attr.size) > size) {
+		tprint_struct_next();
+		tprint_more_data_follows();
+	}
+
+	tprint_struct_end();
+}
+
+SYS_FUNC(sched_setattr)
+{
+	if (entering(tcp)) {
+		/* pid */
+		tprints_arg_name("pid");
+		printpid(tcp, tcp->u_arg[0], PT_TGID);
+
+		/* attr */
+		tprints_arg_next_name("attr");
+		print_sched_attr(tcp, tcp->u_arg[1], 0);
+	} else {
+		struct sched_attr attr;
+
+		if (verbose(tcp) && tcp->u_error == E2BIG
+		    && umove(tcp, tcp->u_arg[1], &attr.size) == 0) {
+			tprint_value_changed();
+			tprint_struct_begin();
+			PRINT_FIELD_U(attr, size);
+			tprint_struct_end();
+		}
+
+		/* flags */
+		tprints_arg_next_name("flags");
+		PRINT_VAL_X((unsigned int) tcp->u_arg[2]);
+	}
+
+	return 0;
+}
+
+SYS_FUNC(sched_getattr)
+{
+	if (entering(tcp)) {
+		/* pid */
+		tprints_arg_name("pid");
+		printpid(tcp, tcp->u_arg[0], PT_TGID);
+	} else {
+		const unsigned int size = tcp->u_arg[2];
+
+		/* attr */
+		tprints_arg_next_name("attr");
+		if (size)
+			print_sched_attr(tcp, tcp->u_arg[1], size);
+		else
+			printaddr(tcp->u_arg[1]);
+
+		/* size */
+		tprints_arg_next_name("size");
+#ifdef AARCH64
+		/*
+		 * Due to a subtle gcc bug that leads to miscompiled aarch64
+		 * kernels, the 3rd argument of sched_getattr is not quite 32-bit
+		 * as on other architectures.  For more details see
+		 * https://lists.strace.io/pipermail/strace-devel/2017-March/006085.html
+		 */
+		if (syserror(tcp)) {
+			tprint_flags_begin();
+			print_abnormal_hi(tcp->u_arg[2]);
+			PRINT_VAL_U(size);
+			tprint_flags_end();
+		} else
+#endif
+		{
+			PRINT_VAL_U(size);
+		}
+
+		/* flags */
+		tprints_arg_next_name("flags");
+		printflags(sched_getattr_flags, tcp->u_arg[3],
+			   "SCHED_GETATTR_FLAG_???");
+	}
+
+	return 0;
+}

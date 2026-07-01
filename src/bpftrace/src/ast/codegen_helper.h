@@ -1,0 +1,39 @@
+#pragma once
+
+#include "ast/ast.h"
+#include "types.h"
+
+namespace bpftrace::ast {
+
+inline bool needMemcpy(const SizedType &stype)
+{
+  return stype.IsAggregate() || stype.IsTimestampTy() || stype.IsCgroupPathTy();
+}
+
+// BPF memory is memory that the program can access with a regular
+// dereference. This could mean the value is on the stack, a map, or
+// maybe something else (like BPF arenas) in the future.
+//
+// This means that a bpf_probe_read_*() is _NOT_ required.
+inline bool shouldBeInBpfMemoryAlready(const SizedType &type)
+{
+  return type.IsStringTy() || type.IsBufferTy() || type.IsInetTy() ||
+         type.IsUsymTy() || type.IsKstackTy() || type.IsUstackTy() ||
+         type.IsTupleTy() || type.IsRecordTy() || type.IsTimestampTy() ||
+         type.IsMacAddressTy() || type.IsCgroupPathTy();
+}
+
+inline bool inBpfMemory(const SizedType &type)
+{
+  return type.is_internal || shouldBeInBpfMemoryAlready(type);
+}
+
+inline AddrSpace find_addrspace_stack(const SizedType &ty)
+{
+  return (shouldBeInBpfMemoryAlready(ty)) ? AddrSpace::kernel : ty.GetAS();
+}
+
+// This applies to both map keys and map values
+bool needMapAllocation(const SizedType &src, const SizedType &dst);
+
+} // namespace bpftrace::ast

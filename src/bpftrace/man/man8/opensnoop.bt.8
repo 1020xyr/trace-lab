@@ -1,0 +1,68 @@
+.TH opensnoop.bt 8  "2018-09-08" "USER COMMANDS"
+.SH NAME
+opensnoop.bt \- Trace open(),openat(),openat2() syscalls. Uses bpftrace/eBPF.
+.SH SYNOPSIS
+.B opensnoop.bt -- [--depth=<N>] [--errname]
+.SH DESCRIPTION
+opensnoop traces the open(),openat(),openat2() syscall, showing which processes
+are attempting to open which files. This can be useful for determining the
+location of config and log files, or for troubleshooting applications that are
+failing, specially on startup.
+
+This works by tracing the open(),openat(),openat2() syscall tracepoint.
+
+Since this uses BPF, only the root user can use this tool.
+.SH OPTIONS
+.TP
+--depth=<N>
+Used to set the maximum supported path depth, default is 35.
+.TP
+--errname
+Show error message instead of errno.
+.SH REQUIREMENTS
+CONFIG_BPF and bcc.
+.SH EXAMPLES
+.TP
+Trace all open(),openat(),openat2() syscalls:
+#
+.B opensnoop.bt
+.SH FIELDS
+PID
+Process ID
+.TP
+COMM
+Process name
+.TP
+FD
+File descriptor (if success), or -1 (if failed)
+.TP
+ERR
+Error number (see the system's errno.h)
+.TP
+PATH
+Open path
+.SH OVERHEAD
+This traces the open tracepoint and prints output for each event. As the
+rate of this is generally expected to be low (< 1000/s), the overhead is also
+expected to be negligible. If you have an application that is calling a high
+rate of open()s, then test and understand overhead before use.
+.SH SOURCE
+This is from bpftrace.
+.IP
+https://github.com/bpftrace/bpftrace
+.PP
+Also look in the bpftrace distribution for a companion _examples.txt file containing
+example usage, output, and commentary for this tool.
+
+This is a bpftrace version of the bcc tool of the same name. The bcc tool
+may provide more options and customizations.
+.IP
+https://github.com/iovisor/bcc
+.SH OS
+Linux
+.SH STABILITY
+Unstable - in development.
+.SH AUTHORS
+Brendan Gregg, Rong Tao <rongtao@cestc.cn>
+.SH SEE ALSO
+statsnoop.bt(8), execsnoop.bt(8)

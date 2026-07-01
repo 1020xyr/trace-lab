@@ -1,0 +1,48 @@
+# This workflow builds and uploads the bpftrace appimage as a build artifact.
+#
+# This is useful for users who want to download the latest and greatest bpftrace
+# binary without going through a local build.
+
+name: Binary
+
+on:
+  push:
+    branches:
+      - master
+      - 'release/**'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-upload:
+    name: ${{ (github.event_name == 'pull_request' && 'build' || 'build-and-upload') }} (${{ matrix.runner }})
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+
+    # For flakehub cache
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - uses: DeterminateSystems/nix-installer-action@v17
+      with:
+        determinate: true
+    - uses: DeterminateSystems/flakehub-cache-action@v2
+
+    - name: Build appimage
+      run: |
+        nix build .?submodules=1#appimage
+        cp ./result bpftrace
+
+    - name: Upload appimage
+      if: github.event_name != 'pull_request'
+      uses: actions/upload-artifact@v4
+      with:
+        name: bpftrace-${{ runner.arch }}
+        path: ./bpftrace

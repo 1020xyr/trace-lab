@@ -1,19 +1,42 @@
-# 源码仓库（仅本地使用，不纳入版本管理）
-src/
-
 # 编译产物
 *.o
 *.ko
 *.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+*.elf
+*.map
 *.bin
 *.blktrace.*
+*.a
+*.so
+*.so.*
+
+# 编译中间文件
+*.gcno
+*.gcda
+*.gcov
+
+# 内核编译产物
+src/linux-5.10/vmlinux
+src/linux-5.10/System.map
+src/linux-5.10/Module.symvers
+src/linux-5.10/.config
+src/linux-5.10/.config.old
 
 # 编辑器
 .vscode/
 *.swp
 *.swo
 *~
+tags
 
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# Python 编译产物
+__pycache__/
+*.pyc

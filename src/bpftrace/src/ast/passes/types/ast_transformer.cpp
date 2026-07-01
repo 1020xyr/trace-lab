@@ -1,0 +1,273 @@
+#include "ast/passes/types/ast_transformer.h"
+#include "ast/ast.h"
+#include "ast/passes/fold_literals.h"
+#include "ast/passes/macro_expansion.h"
+#include "ast/passes/types/cast_creator.h"
+#include "ast/visitor.h"
+#include "struct.h"
+#include "types.h"
+
+#include <optional>
+
+namespace bpftrace::ast {
+
+namespace {
+
+class AstTransformer
+    : public Visitor<AstTransformer, std::optional<Expression>> {
+public:
+  AstTransformer(ASTContext &ast,
+                 const MacroRegistry &macro_registry,
+                 const ResolvedTypes &resolved_types)
+      : ast_(ast),
+        macro_registry_(macro_registry),
+        resolved_types_(resolved_types) {};
+
+  using Visitor<AstTransformer, std::optional<Expression>>::visit;
+
+  std::optional<Expression> visit(ArrayAccess &acc);
+  std::optional<Expression> visit(Cast &cast);
+  std::optional<Expression> visit(Expression &expr);
+  std::optional<Expression> visit(Binop &binop);
+  std::optional<Expression> visit(Offsetof &offof);
+  std::optional<Expression> visit(Sizeof &szof);
+  std::optional<Expression> visit(Typeinfo &typeinfo);
+  std::optional<Expression> visit(FieldAccess &acc);
+
+  bool had_transforms() const
+  {
+    return had_transforms_;
+  }
+
+private:
+  ASTContext &ast_;
+  const MacroRegistry &macro_registry_;
+  const ResolvedTypes &resolved_types_;
+  bool had_transforms_ = false;
+
+  const SizedType &get_type(const TypeVariable &node) const
+  {
+    auto it = resolved_types_.find(node);
+    if (it != resolved_types_.end()) {
+      return it->second;
+    }
+    static SizedType none = CreateNone();
+    return none;
+  }
+};
+
+std::optional<Expression> AstTransformer::visit(ArrayAccess &acc)
+{
+  visit(acc.expr);
+  visit(acc.indexpr);
+
+  if (get_type(&acc.expr.node()).IsTupleTy()) {
+    if (auto *index = acc.indexpr.as<Integer>()) {
+      return ast_.make_node<TupleAccess>(acc.loc,
+                                         acc.expr,
+                                         static_cast<ssize_t>(index->value));
+    } else {
+      acc.addError()
+          << "Array-style access for tuples only valid for integer literals";
+    }
+  }
+
+  return std::nullopt;
+}
+
+std::optional<Expression> AstTransformer::visit(Binop &binop)
+{
+  visit(binop.left);
+  visit(binop.right);
+
+  const auto &lht = get_type(&binop.left.node());
+  const auto &rht = get_type(&binop.right.node());
+
+  if (binop.op != Operator::EQ && binop.op != Operator::NE)
+    return std::nullopt;
+
+  if (!lht.IsTupleTy() && !lht.IsRecordTy())
+    return std::nullopt;
+
+  if (!lht.IsCompatible(rht))
+    return std::nullopt;
+
+  if (binop.left.is_literal() && binop.right.is_literal()) {
+    // This will get folded.
+    return std::nullopt;
+  }
+
+  bool is_tuple = lht.IsTupleTy();
+  auto updatedTy = is_tuple ? get_promoted_tuple(lht, rht)
+                            : get_promoted_record(lht, rht);
+  if (!updatedTy) {
+    binop.addError() << "Type mismatch for '" << opstr(binop) << "': comparing "
+                     << lht << " with " << rht;
+    return std::nullopt;
+  }
+
+  auto updated_lht = lht;
+  if (*updatedTy != lht) {
+    auto updated = is_tuple
+                       ? try_tuple_cast(ast_, binop.left, lht, *updatedTy)
+                       : try_record_cast(ast_, binop.left, lht, *updatedTy);
+    if (updated) {
+      updated_lht = *updated;
+    }
+  }
+
+  auto updated_rht = rht;
+  if (*updatedTy != rht) {
+    auto updated = is_tuple
+                       ? try_tuple_cast(ast_, binop.right, rht, *updatedTy)
+                       : try_record_cast(ast_, binop.right, rht, *updatedTy);
+    if (updated) {
+      updated_rht = *updated;
+    }
+  }
+  auto *size = ast_.make_node<Integer>(binop.loc, updatedTy->GetSize());
+  // N.B. if the types aren't equal at this point it means that
+  // we're dealing with record types that are same except for
+  // their fields are in a different order so we need to use a
+  // different memcmp that saves off both the left and right to
+  // variables but sets the type of the right variable to the left
+  // before assignment (e.g. `let $right: typeof($left) = right;`)
+  // as this ensures the temporary `$right` variable has the same
+  // field ordering as the `$left`.
+  auto *call = ast_.make_node<Call>(
+      binop.loc,
+      updated_rht == updated_lht ? "memcmp" : "memcmp_record",
+      ExpressionList{ binop.left, binop.right, size });
+  auto *parsed_type = ast_.make_node<ParsedType>(binop.loc,
+                                                 ParsedType::Kind::Identifier,
+                                                 "bool");
+  auto *typeof_node = ast_.make_node<Typeof>(binop.loc, parsed_type);
+  auto *cast = ast_.make_node<Cast>(binop.loc, typeof_node, call);
+  if (binop.op == Operator::NE) {
+    return cast;
+  } else {
+    return ast_.make_node<Unop>(binop.loc, cast, Operator::LNOT);
+  }
+}
+
+std::optional<Expression> AstTransformer::visit(Cast &cast)
+{
+  visit(cast.expr);
+  if (get_type(&cast).IsBoolTy() && cast.expr.is_literal()) {
+    return ast_.make_node<Boolean>(cast.expr.loc(), eval_bool(cast.expr));
+  }
+  return std::nullopt;
+}
+
+std::optional<Expression> AstTransformer::visit(Expression &expr)
+{
+  auto r = Visitor<AstTransformer, std::optional<Expression>>::visit(
+      expr.value);
+  if (r) {
+    had_transforms_ = true;
+    expr.value = r->value;
+    expand_macro(ast_, expr, macro_registry_);
+  }
+  return std::nullopt;
+}
+
+std::optional<Expression> AstTransformer::visit(FieldAccess &acc)
+{
+  visit(acc.expr);
+
+  // FieldAccesses will automatically resolve through any number of pointer
+  // dereferences. For now, we inject the `Unop` operator directly, as codegen
+  // stores the underlying structs as pointers anyways. In the future, we will
+  // likely want to do this in a different way if we are tracking l-values.
+  auto type = get_type(&acc.expr.node());
+  while (type.IsPtrTy()) {
+    auto *unop = ast_.make_node<Unop>(acc.expr.node().loc,
+                                      acc.expr,
+                                      Operator::MUL);
+    acc.expr.value = unop;
+    had_transforms_ = true;
+    type = type.GetPointeeTy();
+  }
+
+  return std::nullopt;
+}
+
+std::optional<Expression> AstTransformer::visit(Offsetof &offof)
+{
+  SizedType c_type;
+  if (std::holds_alternative<ParsedType *>(offof.record)) {
+    c_type = get_type(std::get<ParsedType *>(offof.record));
+  } else {
+    c_type = get_type(&std::get<Expression>(offof.record).node());
+  }
+
+  if (c_type.IsNoneTy()) {
+    return std::nullopt;
+  }
+
+  size_t offset = 0;
+  for (const auto &field : offof.field) {
+    if (!c_type.IsCTypeTy() || !c_type.HasField(field)) {
+      return std::nullopt;
+    }
+    const auto &f = c_type.GetField(field);
+    offset += f.offset;
+    c_type = f.type;
+  }
+
+  return ast_.make_node<Integer>(Location(offof.loc), offset);
+}
+
+std::optional<Expression> AstTransformer::visit(Sizeof &szof)
+{
+  size_t size = 0;
+  if (std::holds_alternative<ParsedType *>(szof.record)) {
+    const auto &ty = get_type(std::get<ParsedType *>(szof.record));
+    if (ty.IsNoneTy()) {
+      return std::nullopt;
+    }
+    size = ty.GetSize();
+  } else {
+    const auto &ty = get_type(&std::get<Expression>(szof.record).node());
+    if (ty.IsNoneTy()) {
+      return std::nullopt;
+    }
+    size = ty.GetSize();
+  }
+
+  return ast_.make_node<Integer>(Location(szof.loc), size);
+}
+
+std::optional<Expression> AstTransformer::visit(Typeinfo &typeinfo)
+{
+  const auto &type = get_type(typeinfo.typeof);
+  if (type.IsNoneTy()) {
+    return std::nullopt;
+  }
+
+  // We currently lack a globally-unique enumeration of types. For
+  // simplicity, just use the type string with a placeholder identifier.
+  auto *id = ast_.make_node<Integer>(typeinfo.loc, 0);
+  auto *base_ty = ast_.make_node<String>(typeinfo.loc, to_string(type.GetTy()));
+  auto *full_ty = ast_.make_node<String>(typeinfo.loc, typestr(type));
+
+  auto *record = make_record(
+      ast_,
+      typeinfo.loc,
+      { { "btf_id", id }, { "base_type", base_ty }, { "full_type", full_ty } });
+
+  return record;
+}
+
+} // namespace
+
+bool RunAstTransformer(ASTContext &ast,
+                       const MacroRegistry &macro_registry,
+                       const ResolvedTypes &resolved_types)
+{
+  AstTransformer transformer(ast, macro_registry, resolved_types);
+  transformer.visit(ast.root);
+  return transformer.had_transforms();
+}
+
+} // namespace bpftrace::ast

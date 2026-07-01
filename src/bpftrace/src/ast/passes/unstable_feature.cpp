@@ -1,0 +1,144 @@
+#include <cstring>
+#include <string>
+#include <utility>
+
+#include "ast/ast.h"
+#include "ast/passes/unstable_feature.h"
+#include "ast/visitor.h"
+#include "bpftrace.h"
+#include "config.h"
+#include "log.h"
+
+namespace bpftrace::ast {
+
+namespace {
+
+const auto MAP_DECL = "map declarations";
+const auto IMPORTS = "imports";
+const auto IMPORT_STATEMENTS = "import statements";
+const auto TSERIES = "tseries";
+const auto ADDR = "address-of operator (&)";
+const auto TYPEINFO = "typeinfo";
+const auto DW_USTACK = "dw_ustack (DWARF stack unwinding)";
+
+std::string get_warning(const std::string &feature, const std::string &config)
+{
+  return std::string("Script is using an unstable feature: " + feature +
+                     ". To prevent this warning you must explicitly enable it "
+                     "in the config e.g. ") +
+         config + std::string("=enable");
+}
+
+std::string get_error(const std::string &feature, const std::string &config)
+{
+  return std::string(feature +
+                     " feature is not enabled by default. To enable "
+                     "this unstable feature, set the config flag to enable. ") +
+         config + std::string("=enable");
+}
+
+class UnstableFeature : public Visitor<UnstableFeature> {
+public:
+  explicit UnstableFeature(BPFtrace &bpftrace) : bpftrace_(bpftrace) {};
+
+  using Visitor<UnstableFeature>::visit;
+  void visit(StatementImport &imp);
+  void visit(Call &call);
+  void visit(Typeinfo &typeinfo);
+
+private:
+  BPFtrace &bpftrace_;
+  // This set is so we don't warn multiple times for the same feature.
+  std::unordered_set<std::string> warned_features;
+
+  void check_unstable_tseries(Node &node);
+  void check_unstable_dw_ustack(Node &node);
+};
+
+} // namespace
+
+// Note: for logged warnings we don't want to use the AST node's `addWarning()`
+// as this also prints the code location which is overly noisy. We just
+// want to notify users they're using an unstable feature. For errors it's ok to
+// print the location because the script is going to fail anyway.
+
+void UnstableFeature::visit(StatementImport &imp)
+{
+  if (bpftrace_.config_->unstable_import_statement == ConfigUnstable::error) {
+    imp.addError()
+        << "Import statements that are not at the top level are primarily for "
+           "the standard library. If this is functionality you need, please "
+           "file an issue to explain why.";
+    return;
+  }
+
+  if (bpftrace_.config_->unstable_import_statement == ConfigUnstable::warn &&
+      !warned_features.contains(UNSTABLE_IMPORT_STATEMENT)) {
+    LOG(WARNING) << get_warning(IMPORT_STATEMENTS, UNSTABLE_IMPORT_STATEMENT);
+    warned_features.insert(UNSTABLE_IMPORT_STATEMENT);
+  }
+}
+
+void UnstableFeature::visit(Call &call)
+{
+  if (call.func == "tseries") {
+    check_unstable_tseries(call);
+  } else if (call.func == "dw_ustack") {
+    check_unstable_dw_ustack(call);
+  }
+  Visitor<UnstableFeature>::visit(call.vargs);
+}
+
+void UnstableFeature::visit(Typeinfo &typeinfo)
+{
+  if (bpftrace_.config_->unstable_typeinfo == ConfigUnstable::error) {
+    typeinfo.addError() << get_error(TYPEINFO, UNSTABLE_TYPEINFO);
+  } else if (bpftrace_.config_->unstable_typeinfo == ConfigUnstable::warn &&
+             !warned_features.contains(UNSTABLE_TYPEINFO)) {
+    LOG(WARNING) << get_warning(TYPEINFO, UNSTABLE_TYPEINFO);
+    warned_features.insert(UNSTABLE_TYPEINFO);
+  }
+}
+
+void UnstableFeature::check_unstable_tseries(Node &node)
+{
+  if (bpftrace_.config_->unstable_tseries == ConfigUnstable::error) {
+    node.addError() << get_error(TSERIES, UNSTABLE_TSERIES);
+    return;
+  }
+
+  if (bpftrace_.config_->unstable_tseries == ConfigUnstable::warn &&
+      !warned_features.contains(UNSTABLE_TSERIES)) {
+    LOG(WARNING) << get_warning(TSERIES, UNSTABLE_TSERIES);
+    warned_features.insert(UNSTABLE_TSERIES);
+  }
+}
+
+void UnstableFeature::check_unstable_dw_ustack(Node &node)
+{
+#ifndef HAVE_DW_UNWIND
+  node.addError() << "dw_ustack is not available in this build "
+                     "(requires x86_64 and LLVM >= 21)";
+#else
+  if (bpftrace_.config_->unstable_dw_ustack == ConfigUnstable::error) {
+    node.addError() << get_error(DW_USTACK, UNSTABLE_DW_USTACK);
+    return;
+  }
+
+  if (bpftrace_.config_->unstable_dw_ustack == ConfigUnstable::warn &&
+      !warned_features.contains(UNSTABLE_DW_USTACK)) {
+    LOG(WARNING) << get_warning(DW_USTACK, UNSTABLE_DW_USTACK);
+    warned_features.insert(UNSTABLE_DW_USTACK);
+  }
+#endif // HAVE_DW_UNWIND
+}
+
+Pass CreateUnstableFeaturePass()
+{
+  return Pass::create("UnstableFeature", [](ASTContext &ast, BPFtrace &b) {
+    auto configs = UnstableFeature(b);
+    configs.visit(ast.root);
+  });
+};
+
+} // namespace bpftrace::ast
