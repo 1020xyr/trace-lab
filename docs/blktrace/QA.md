@@ -10,6 +10,7 @@
 - [Q2: 为什么 BLK_TC_QUEUE 和 \_\_BLK_TA_ISSUE 都是入队？](#q2-为什么-blk_tc_queue-和-__blk_ta_issue-都是入队)
 - [Q3: rwbs 为 N 时如何知道它具体在干嘛？](#q3-rwbs-为-n-时如何知道它具体在干嘛)
 - [Q4: sync、fsync、flush、FUA 有什么差异？](#q4-syncfsyncflush-fua-有什么差异)
+- [Q5: 操作类型用 blk_fill_rwbs 解析，事件类型（D/C/Q）在哪解析？](#q5-操作类型用-blk_fill_rwbs-解析事件类型dcq在哪解析)
 
 ---
 
@@ -357,6 +358,97 @@ dd oflag=sync:
   每次 write()     →  FWSF (Preflush + Write + Sync + FUA)
   → 最重型的持久化保证
 ```
+
+---
+
+## Q5: 操作类型用 blk_fill_rwbs 解析，事件类型（D/C/Q）在哪解析？
+
+**日期：** 2026-07-02  
+**场景：** 理解了 rwbs 字段（R/W/S/F/N）由 `blk_fill_rwbs()` 生成后，想知道事件字母（Q/D/C/G/I/M/P/U）的解析在哪  
+**相关文件：** `05_blkparse.c`  
+**源码位置：** `src/blktrace/blkparse.c` 第 1539-1620 行 — `dump_trace_fs()`
+
+### 回答
+
+action 字段（32 位）被 blkparse **拆成两个独立部分**分别解析：
+
+```
+action (32 位)
+┌───────────────────────────┬──────────────────────────┐
+│ 高 16 位: 类别标志 (BLK_TC_*) │ 低 16 位: 操作类型 (__BLK_TA_*) │
+│ → fill_rwbs() 解析         │ → dump_trace_fs() 解析     │
+│ → 输出 rwbs (R/W/S/F/M/A/N)│ → 输出事件字母 (Q/D/C/G/I/..)│
+│ → blkparse_fmt.c:53        │ → blkparse.c:1539          │
+└───────────────────────────┴──────────────────────────┘
+```
+
+### 核心代码：`dump_trace_fs()`
+
+```c
+// blkparse.c:1539
+static void dump_trace_fs(struct blk_io_trace *t, struct per_dev_info *pdi,
+                          struct per_cpu_info *pci)
+{
+    int w = (t->action & BLK_TC_ACT(BLK_TC_WRITE)) != 0;
+    int act = t->action & 0xffff;    // ★ 提取低 16 位
+
+    switch (act) {
+        case __BLK_TA_QUEUE:        log_queue(pci, t, "Q");          break;
+        case __BLK_TA_INSERT:       log_insert(pdi, pci, t, "I");    break;
+        case __BLK_TA_BACKMERGE:    log_merge(pdi, pci, t, "M");     break;
+        case __BLK_TA_FRONTMERGE:   log_merge(pdi, pci, t, "F");     break;
+        case __BLK_TA_GETRQ:        log_generic(pci, t, "G");        break;
+        case __BLK_TA_SLEEPRQ:      log_generic(pci, t, "S");        break;
+        case __BLK_TA_REQUEUE:      log_queue(pci, t, "R");          break;
+        case __BLK_TA_ISSUE:        log_issue(pdi, pci, t, "D");     break;
+        case __BLK_TA_COMPLETE:     log_complete(pdi, pci, t, "C");  break;
+        case __BLK_TA_PLUG:         log_action(pci, t, "P");         break;
+        case __BLK_TA_UNPLUG_IO:    log_unplug(pci, t, "U");         break;
+        case __BLK_TA_UNPLUG_TIMER: log_unplug(pci, t, "UT");        break;
+        case __BLK_TA_SPLIT:        log_split(pci, t, "X");          break;
+        case __BLK_TA_BOUNCE:       log_generic(pci, t, "B");        break;
+        case __BLK_TA_REMAP:        log_generic(pci, t, "A");        break;
+    }
+}
+```
+
+### 完整映射表
+
+| \_\_BLK_TA\_\* | 值 | 字母 | 含义 |
+|---------------|-----|------|------|
+| QUEUE | 1 | Q | bio 入队 |
+| BACKMERGE | 2 | M | 后向合并 |
+| FRONTMERGE | 3 | F | 前向合并 |
+| GETRQ | 4 | G | 分配 request |
+| SLEEPRQ | 5 | S | 等待分配 |
+| REQUEUE | 6 | R | 重新入队 |
+| ISSUE | 7 | **D** | 下发到驱动 |
+| COMPLETE | 8 | **C** | I/O 完成 |
+| PLUG | 9 | P | 插队 |
+| UNPLUG_IO | 10 | U | I/O 触发拔塞 |
+| UNPLUG_TIMER | 11 | UT | 定时器拔塞 |
+| INSERT | 12 | I | 插入调度器 |
+| SPLIT | 13 | X | bio 拆分 |
+| BOUNCE | 14 | B | bounce buffer |
+| REMAP | 15 | A | 重映射（DM/LVM） |
+
+### 调用链
+
+```
+dump_trace(t, pci, pdi)                  // blkparse.c:1622
+  │
+  ├── action == BLK_TN_MESSAGE → handle_notify()
+  │
+  ├── action & BLK_TC_ACT(BLK_TC_PC)
+  │     → dump_trace_pc()                // SCSI 请求（同样的 switch 逻辑）
+  │
+  └── else
+        → dump_trace_fs()                // ★ 文件系统请求
+            switch (action & 0xffff)     // 低 16 位匹配 → 事件字母
+            同时 fill_rwbs()             // 高 16 位提取 → rwbs 字段
+```
+
+**一句话总结：** rwbs 和事件字母是 action 字段的两个独立维度 — 高 16 位通过 `fill_rwbs()` 生成 rwbs，低 16 位通过 `dump_trace_fs()` 的 switch 生成事件字母。
 
 ---
 
