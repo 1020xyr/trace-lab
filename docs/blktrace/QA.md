@@ -12,6 +12,7 @@
 - [Q4: sync、fsync、flush、FUA 有什么差异？](#q4-syncfsyncflush-fua-有什么差异)
 - [Q5: 操作类型用 blk_fill_rwbs 解析，事件类型（D/C/Q）在哪解析？](#q5-操作类型用-blk_fill_rwbs-解析事件类型dcq在哪解析)
 - [Q6: setup_buts() 中 buts 是什么的缩写？](#q6-setup_buts-中-buts-是什么的缩写)
+- [Q7: 为什么 per-CPU 设计？relay buffer 为什么还可能溢出？](#q7-为什么-per-cpu-设计relay-buffer-为什么还可能溢出)
 
 ---
 
@@ -498,6 +499,145 @@ static void setup_buts(void)
 - `struct request_queue *rq`
 - `struct block_device *bdev`
 - `struct blk_user_trace_setup buts`
+
+---
+
+## Q7: 为什么 per-CPU 设计？relay buffer 为什么还可能溢出？
+
+**日期：** 2026-07-02  
+**场景：** 阅读 `04_userspace_blktrace.c` 中的 relay buffer 和 per-CPU 线程设计时产生的疑问  
+**相关文件：** `03_kernel_blktrace.c`、`04_userspace_blktrace.c`  
+**源码位置：** `kernel/trace/blktrace.c` — `__blk_add_trace()`、`blktrace.c` — `thread_main()`
+
+### 回答
+
+#### 一、为什么 per-CPU？不仅仅是无锁
+
+**首要原因：热路径零锁竞争。** `__blk_add_trace()` 运行在 I/O 热路径上，每秒可能调用百万次。全局锁会导致严重串行化。
+
+```c
+// kernel/trace/blktrace.c: __blk_add_trace()
+cpu = raw_smp_processor_id();       // 获取当前 CPU 号
+
+local_irq_save(flags);              // ★ 关中断（不是关锁！）
+t = relay_reserve(bt->rchan, ...);  // 在当前 CPU 的 buffer 中预留空间
+local_irq_restore(flags);           // 恢复中断
+```
+
+关中断（而非加锁）的原因是防止**同一 CPU** 上的中断处理程序也触发 `__blk_add_trace()`，干扰 `relay_reserve()` 的内部状态。跨 CPU 之间完全无干扰。
+
+| 好处 | 说明 |
+|------|------|
+| **零锁竞争** | 每个 CPU 写自己的 buffer，无需 spin_lock |
+| **缓存局部性** | 写自己 CPU 的 buffer，不会导致其他 CPU 缓存行失效 |
+| **NUMA 友好** | buffer 分配在本地 NUMA 节点 |
+| **事件顺序** | 同一 CPU 上天然有序 |
+| **可伸缩性** | 增加 CPU 不增加竞争，追踪开销恒定 |
+
+#### 二、全链路 per-CPU 架构
+
+从内核到用户态全程 per-CPU：
+
+```
+__blk_add_trace(CPU 0) → relay_buf_0 → debugfs/trace0 → thread_0(绑定CPU 0) → sda.blktrace.0
+__blk_add_trace(CPU 1) → relay_buf_1 → debugfs/trace1 → thread_1(绑定CPU 1) → sda.blktrace.1
+```
+
+用户态线程绑定 CPU 的源码：
+
+```c
+// blktrace.c: thread_main()
+static void *thread_main(void *arg)
+{
+    struct tracer *tp = arg;
+    ret = lock_on_cpu(tp->cpu);     // ★ 绑定到指定 CPU
+    while (!tp->is_done) {
+        ndone = poll(tp->pfds, ndevs, to_val);  // 只 poll 自己 CPU 的 relay 文件
+        // ...
+    }
+}
+```
+
+#### 三、缺点
+
+| 缺点 | 说明 | 解决方案 |
+|------|------|---------|
+| **事件乱序** | 不同 CPU 的事件时间不保证顺序 | blkparse 归并排序（按时间戳合并） |
+| **内存开销 ×N** | 8 核 = 8 × 2MB = 16MB | 可接受，可通过 `-b`/`-n` 调整 |
+| **配对复杂** | btt 需跨 CPU 配对 Q 和 C（C 在中断上下文，可能在不同 CPU） | btt 用 device+sector 配对 |
+
+**最大缺点是事件乱序**——这正是 blkparse 存在的核心原因。
+
+#### 四、relay buffer 大小考量
+
+```
+默认参数：
+  BUF_SIZE = 512KB (每个 subbuffer)
+  BUF_NR   = 4     (每个 CPU 4 个 subbuffer)
+  每个 CPU 总缓冲 = 512KB × 4 = 2MB
+
+┌──────────┬──────────┬──────────┬──────────┐
+│ subbuf 0 │ subbuf 1 │ subbuf 2 │ subbuf 3 │
+│  512KB   │  512KB   │  512KB   │  512KB   │
+│  [写满]  │  [写入中] │  [空闲]  │ [用户态读]│
+└──────────┴──────────┴──────────┴──────────┘
+     ↑ write                     ↑ read
+     kernel                      userspace
+```
+
+512KB 的计算依据：
+```
+每个 blk_io_trace = 48 字节
+512KB / 48 ≈ 10,000 个事件/subbuffer
+假设 IOPS=100,000/s × 5 事件/I/O = 500,000 事件/s
+每 subbuffer 容纳 ≈ 0.02 秒事件
+4 个 subbuffer ≈ 0.08 秒缓冲
+用户态需在 80ms 内读完一个 subbuffer（绰绰有余）
+```
+
+#### 五、为什么持续 poll 仍然可能溢出？
+
+**正常情况下确实不会溢出。** 但以下场景会：
+
+**场景 1：I/O 突发（burst）**
+```
+瞬间百万事件 → 4 个 subbuffer 在几毫秒内全满
+→ poll 还没返回（最小延迟 ~1μs）→ dropped!
+```
+
+**场景 2：用户态线程被抢占**
+```
+线程被调度器换出 → relay buffer 继续写入
+→ 恢复时 buffer 已被覆盖 → dropped!
+```
+
+**场景 3：输出磁盘慢**
+```
+write() 到慢速磁盘（如 NFS）→ 阻塞 → 无法回到 poll()
+→ relay buffer 积压 → dropped!
+```
+
+**场景 4：极高 IOPS 设备**
+```
+企业级 NVMe: 1,000,000+ IOPS × 5 事件 = 5,000,000 事件/s
+× 48 字节 = 240 MB/s → 大多数磁盘写不了这么快 → dropped!
+```
+
+**检查 dropped：**
+```bash
+cat /sys/kernel/debug/block/vdb/dropped
+# blktrace 结束时也会报告：
+# Total: 152008 events (dropped 0)     ← 无丢失
+# Total: 152008 events (dropped 1234)  ← 有 1234 个丢失
+```
+
+**避免 dropped 的方法：**
+```bash
+blktrace -d /dev/vdb -b 4096 -n 8            # 增大 buffer（32MB/CPU）
+blktrace -d /dev/vdb -a issue -a complete     # 过滤事件（减少 76% 数据量）
+blktrace -d /dev/vdb -o /tmp/trace            # 输出到快速磁盘
+blktrace -d /dev/vdb -o - | blkparse -i -     # 管道模式（不落盘）
+```
 
 ---
 
