@@ -14,6 +14,7 @@
 - [Q6: setup_buts() 中 buts 是什么的缩写？](#q6-setup_buts-中-buts-是什么的缩写)
 - [Q7: 为什么 per-CPU 设计？relay buffer 为什么还可能溢出？](#q7-为什么-per-cpu-设计relay-buffer-为什么还可能溢出)
 - [Q8: btt 的 seek 分析如何工作？如何判断顺序/随机 I/O？btt 该看哪些指标？](#q8-btt-的-seek-分析如何工作如何判断顺序随机-iobtt-该看哪些指标)
+- [Q9: blkiomon -I 5 -d /dev/vdb 为什么没有输出？](#q9-blkiomon--i-5--d-devvdb-为什么没有输出)
 
 ---
 
@@ -769,6 +770,64 @@ Q2C               ← ★ 端到端总延迟（用户感知）
 *_iops_*.dat → IOPS 时间线
 *_mbps_*.dat → 吞吐量时间线
 ```
+
+---
+
+## Q9: blkiomon -I 5 -d /dev/vdb 为什么没有输出？
+
+**日期：** 2026-07-02  
+**场景：** 按命令参考文档运行 `blkiomon -I 5 -d /dev/vdb` 无输出  
+**相关文件：** `08_command_reference.md`（已修正错误用法）  
+**源码位置：** `src/blktrace/blkiomon.c:731` — `ifp = fdopen(STDIN_FILENO, "r")`
+
+### 回答
+
+**blkiomon 的 `-d` 参数不是指定设备，而是指定"低层驱动数据输出文件"。** blkiomon 从 **stdin** 读取 blktrace 的二进制数据流，必须通过管道与 blktrace 配合使用。
+
+源码证据：
+```c
+// blkiomon.c:731
+ifp = fdopen(STDIN_FILENO, "r");   // ★ 从 stdin 读取，不接受设备参数
+```
+
+### 正确用法
+
+```bash
+# ★ blktrace 输出到 stdout(-o -) → 管道 → blkiomon 从 stdin 读取
+blktrace -d /dev/vdb -o - | blkiomon -I 5 -h /dev/stdout
+
+# 限时追踪 + 输出到文件
+blktrace -d /dev/vdb -o - -w 30 | blkiomon -I 5 -h monitor.txt
+
+# 同时输出二进制数据
+blktrace -d /dev/vdb -o - | blkiomon -I 5 -h /dev/stdout -b binary.dat
+```
+
+### blkiomon 参数速查
+
+| 参数 | 含义 | 注意 |
+|------|------|------|
+| `-I 5` | 每 5 秒输出一次统计 | **必填** |
+| `-h file` | 人类可读输出 | `-h /dev/stdout` 打印到终端 |
+| `-b file` | 二进制输出 | 供后续工具分析 |
+| `-d file` | 低层驱动数据输出 | **不是设备！** |
+| `-D file` | 调试输出 | — |
+
+### blkiomon 输出解读
+
+```
+device: 253,16                          ← 设备号
+sizes write (bytes): avg 4096.0         ← 平均写大小
+d2c write (usec): avg 145.6             ← ★ D2C 延迟（μs）
+throughput write: avg 29310 bytes/msec  ← 吞吐（bytes/ms）
+d2c histogram (usec):                   ← D2C 延迟分布
+  128: 2656    ← 大部分在 128-256μs
+  256: 7148
+```
+
+### 命令参考中的错误已修正
+
+`08_command_reference.md` 中的 `blkiomon -I 5 -d /dev/sda` 已修正为正确的管道用法。
 
 ---
 

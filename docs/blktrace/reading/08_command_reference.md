@@ -325,9 +325,11 @@ blkparse -i trace -o parsed.txt
 ### 场景 6：实时监控（blkiomon）
 
 ```bash
-# blkiomon 是 blktrace 工具包中的实时监控工具
-blkiomon -I 5 -d /dev/sda
+# blkiomon 从 stdin 读取 blktrace 的二进制流（必须用管道）
+# -o - 让 blktrace 输出到 stdout，通过管道传给 blkiomon
+blktrace -d /dev/vdb -o - | blkiomon -I 5 -h /dev/stdout
 # -I 5 = 每 5 秒刷新一次
+# -h /dev/stdout = 人类可读输出到终端
 ```
 
 ### 场景 7：通过 ftrace 验证 blktrace 使用的 tracepoint
