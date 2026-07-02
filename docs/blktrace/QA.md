@@ -13,6 +13,7 @@
 - [Q5: 操作类型用 blk_fill_rwbs 解析，事件类型（D/C/Q）在哪解析？](#q5-操作类型用-blk_fill_rwbs-解析事件类型dcq在哪解析)
 - [Q6: setup_buts() 中 buts 是什么的缩写？](#q6-setup_buts-中-buts-是什么的缩写)
 - [Q7: 为什么 per-CPU 设计？relay buffer 为什么还可能溢出？](#q7-为什么-per-cpu-设计relay-buffer-为什么还可能溢出)
+- [Q8: btt 的 seek 分析如何工作？如何判断顺序/随机 I/O？btt 该看哪些指标？](#q8-btt-的-seek-分析如何工作如何判断顺序随机-iobtt-该看哪些指标)
 
 ---
 
@@ -637,6 +638,136 @@ blktrace -d /dev/vdb -b 4096 -n 8            # 增大 buffer（32MB/CPU）
 blktrace -d /dev/vdb -a issue -a complete     # 过滤事件（减少 76% 数据量）
 blktrace -d /dev/vdb -o /tmp/trace            # 输出到快速磁盘
 blktrace -d /dev/vdb -o - | blkparse -i -     # 管道模式（不落盘）
+```
+
+---
+
+## Q8: btt 的 seek 分析如何工作？如何判断顺序/随机 I/O？btt 该看哪些指标？
+
+**日期：** 2026-07-02  
+**场景：** 阅读 `06_btt_trace_handlers.c` 中的 `seeki_add` 时产生的疑问  
+**相关文件：** `06_btt_trace_handlers.c`  
+**源码位置：** `src/blktrace/btt/seek.c` — `seek_dist()`、`seeki_add()`；`src/blktrace/btt/output.c` — `do_output_dip_seek_info()`
+
+### 回答
+
+#### 一、Seek 分析核心算法 — seek_dist()
+
+btt 通过比较**相邻两次 I/O 的 LBA 范围**，计算扇区级别的"寻道距离"：
+
+```c
+// btt/seek.c:181
+long long seek_dist(struct seeki *sip, struct io *iop)
+{
+    long long start = BIT_START(iop), end = BIT_END(iop);
+    // BIT_START = iop->t.sector          (起始扇区)
+    // BIT_END   = sector + (bytes >> 9)  (结束扇区)
+
+    if (seek_absolute) {
+        dist = start - sip->last_end;       // 绝对距离
+    } else {
+        // ★ 相对模式（默认）：考虑重叠
+        if (有重叠)
+            dist = 0;                       // 重叠 = 无 seek
+        else if (start > sip->last_end)
+            dist = start - sip->last_end;   // 向前 seek
+        else
+            dist = start - sip->last_start; // 向后 seek
+    }
+    sip->last_start = start;
+    sip->last_end = end;
+    return dist;
+}
+```
+
+#### 二、两个维度的 Seek 追踪
+
+| 维度 | 追踪点 | 数据源 | 含义 |
+|------|--------|--------|------|
+| **Q2Q Seek** | Q 事件时 | `trace_queue.c:25` | block layer 视角的 I/O 到达模式 |
+| **D2D Seek** | D 事件时 | `trace_issue.c:31` | 设备视角的实际下发模式 |
+
+I/O 调度器可能重新排序请求，所以 **D2D 的连续性通常比 Q2Q 更好**（调度器优化了顺序）。
+
+#### 三、统计指标
+
+| 指标 | 计算方式 | 含义 |
+|------|---------|------|
+| **NSEEKS** | seek 总次数 | 分析的 I/O 对数 |
+| **MEAN** | total_sectors / tot_seeks | ★ 平均 seek 距离（核心指标） |
+| **MEDIAN** | 红黑树中序遍历找中位数 | 中位数 seek 距离 |
+| **MODE** | 红黑树中出现最多的值 | 最常见的 seek 距离（括号内是出现次数） |
+
+#### 四、如何判断顺序 vs 随机
+
+**MEAN 是关键指标：**
+
+```
+经验法则（扇区单位，1 扇区 = 512 字节）：
+
+  MEAN seek 距离            判定
+  ────────────────────────  ──────────
+  < 1000 扇区 (< 512KB)     → 基本顺序
+  1000~10000 扇区           → 混合模式
+  > 10000 扇区 (> 5MB)      → 明显随机
+```
+
+**真实实验对比：**
+
+```
+Q2Q Seek 对比（我们的 vdb 实验）：
+                NSEEKS     MEAN       MEDIAN   MODE
+随机写 (exp1):   30301    53214.6        0      0(91)
+顺序读 (exp2):   10142      242.0        0      0(10130)
+                          ^^^^^^^^
+                          ★ 差异 220 倍！
+
+随机写 MEAN = 53214 扇区 ≈ 26MB → 每次 I/O 跳跃 ~26MB
+顺序读 MEAN = 242 扇区 ≈ 121KB → 接近连续（128K bs 的完美顺序）
+```
+
+MODE 后面的括号数字 = 该距离出现的次数。顺序读的 MODE=0(10130) 意味着 10130 次 seek 距离为 0（完全连续）。
+
+#### 五、btt 分析时该看哪些指标
+
+**必看指标（每次分析都要看）：**
+
+```
+==================== All Devices ====================
+            ALL           MIN           AVG           MAX           N
+Q2G               ← request 分配延迟
+G2I               ← 进入调度器延迟
+I2D               ← 调度器等待时间
+D2C               ← ★ 设备处理延迟（硬件性能）
+Q2C               ← ★ 端到端总延迟（用户感知）
+```
+
+| 指标 | 诊断价值 | 异常信号 |
+|------|---------|---------|
+| **D2C avg** | 设备处理速度 | 比预期慢 → 硬件问题 |
+| **D2C max** | 长尾延迟 | 异常大 → 设备 retry/timeout |
+| **Q2C avg** | 端到端延迟 | 用户实际感受的延迟 |
+| **Q2D/Q2C 比** | 软件层占比 | >50% → 调度器/队列是瓶颈 |
+
+**按需指标：**
+
+| 指标 | 何时看 | 诊断价值 |
+|------|--------|---------|
+| **Seek MEAN** | 判断顺序/随机 | MEAN 大=随机，小=顺序 |
+| **Merge Ratio** | 看调度器效果 | Ratio > 1 说明合并有效 |
+| **Plug #Plugs** | 看 plug 机制 | 多说明 I/O 提交不连续 |
+| **Q2D 直方图** | 看延迟分布 | 大部分 <5ms 正常 |
+
+**btt 输出文件速查：**
+
+```
+*.avg        → ★ 平均值汇总（最重要，每次必看）
+*_qhist.dat  → Q2D 延迟直方图
+*_dhist.dat  → D2C 延迟直方图
+*_q2c_*.dat  → per-IO Q2C 延迟（可 gnuplot 画图）
+*_d2c_*.dat  → per-IO D2C 延迟
+*_iops_*.dat → IOPS 时间线
+*_mbps_*.dat → 吞吐量时间线
 ```
 
 ---
