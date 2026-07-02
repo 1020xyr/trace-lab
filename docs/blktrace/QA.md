@@ -11,6 +11,7 @@
 - [Q3: rwbs 为 N 时如何知道它具体在干嘛？](#q3-rwbs-为-n-时如何知道它具体在干嘛)
 - [Q4: sync、fsync、flush、FUA 有什么差异？](#q4-syncfsyncflush-fua-有什么差异)
 - [Q5: 操作类型用 blk_fill_rwbs 解析，事件类型（D/C/Q）在哪解析？](#q5-操作类型用-blk_fill_rwbs-解析事件类型dcq在哪解析)
+- [Q6: setup_buts() 中 buts 是什么的缩写？](#q6-setup_buts-中-buts-是什么的缩写)
 
 ---
 
@@ -449,6 +450,54 @@ dump_trace(t, pci, pdi)                  // blkparse.c:1622
 ```
 
 **一句话总结：** rwbs 和事件字母是 action 字段的两个独立维度 — 高 16 位通过 `fill_rwbs()` 生成 rwbs，低 16 位通过 `dump_trace_fs()` 的 switch 生成事件字母。
+
+---
+
+## Q6: setup_buts() 中 buts 是什么的缩写？
+
+**日期：** 2026-07-02  
+**场景：** 阅读用户态 blktrace.c 时遇到 `setup_buts()` 函数名不理解  
+**相关文件：** `04_userspace_blktrace.c`  
+**源码位置：** `src/blktrace/blktrace.c` — `setup_buts()` 函数
+
+### 回答
+
+**buts = Block User Trace Setup**
+
+它是 `struct blk_user_trace_setup` 类型变量的名字：
+
+```
+blk  = Block
+user = User
+trace = Trace
+setup = Setup
+→ buts
+```
+
+从源码中可以看到：
+
+```c
+static void setup_buts(void)
+{
+    __list_for_each(p, &devpaths) {
+        struct blk_user_trace_setup buts;   // ★ buts 是这个结构体的变量名
+
+        buts.buf_size = buf_size;
+        buts.buf_nr = buf_nr;
+        buts.act_mask = act_mask;
+
+        ioctl(dpp->fd, BLKTRACESETUP, &buts);
+    }
+}
+```
+
+`setup_buts()` = "对每个设备配置（setup）一个 `blk_user_trace_setup`（buts）结构体"。  
+同理 `start_buts()` = 用已配置好的 buts 调用 `BLKTRACESTART` ioctl。
+
+这是 Linux 内核社区常见的命名习惯 — 用结构体类型名的首字母缩写作为变量名：
+- `struct request_queue *rq`
+- `struct block_device *bdev`
+- `struct blk_user_trace_setup buts`
 
 ---
 
