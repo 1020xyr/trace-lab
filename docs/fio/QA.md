@@ -12,6 +12,8 @@
 - [Q4: rate_iops 限速机制如何工作？](#q4-rate_iops-限速机制如何工作)
 - [Q5: fio 测延迟为什么必须用 iodepth=1？](#q5-fio-测延迟为什么必须用-iodepth1)
 - [Q6: fio 的 slat/clat 与 blktrace 的 Q2D/D2C 是什么关系？](#q6-fio-的-slatclat-与-blktrace-的-q2dd2c-是什么关系)
+- [Q7: fio 的 --numjobs 和 --iodepth 有什么区别？对 IOPS 的影响是什么？](#q7-fio-的---numjobs-和---iodepth-有什么区别对-iops-的影响是什么)
+- [Q8: 为什么 fio 用 libaio 引擎时必须加 --direct=1？](#q8-为什么-fio-用-libaio-引擎时必须加---direct1)
 
 ---
 
@@ -477,6 +479,271 @@ clat vs D2C 的差异来源：
 ```
 
 **一句话总结：** fio slat ≈ blktrace Q2D（提交延迟），fio clat ≈ blktrace D2C（设备延迟），fio lat ≈ blktrace Q2C（端到端延迟）。差异来自测量视角（用户态 vs 内核态），lat/Q2C 最接近。
+
+---
+
+## Q7: fio 的 --numjobs 和 --iodepth 有什么区别？对 IOPS 的影响是什么？
+
+**日期：** 2026-07-04
+**场景：** 测试 SSD 性能时混淆 numjobs 和 iodepth，导致 IOPS 结果不符合预期
+**相关文件：** `docs/fio/reading/04_backend_do_io.c`
+**源码位置：** `src/fio/options.c:3193-3201`（numjobs 定义）、`src/fio/options.c:2427-2437`（iodepth 定义）、`src/fio/init.c:1965-1997`（job 克隆逻辑）
+
+### 回答
+
+**★ numjobs 创建多个独立的 job（线程/进程），iodepth 控制每个 job 内部的在途 I/O 数。两者是乘法关系：总并发 I/O = numjobs × iodepth。**
+
+#### 核心区别
+
+```
+numjobs（作业级并发）：
+  options.c:3197 — .help = "Duplicate this job this many times"
+  init.c:1965-1997 — 通过 get_new_job() 克隆完全相同的 thread_data
+
+iodepth（I/O 级并发）：
+  options.c:2431 — .help = "Number of IO buffers to keep in flight"
+  backend.c — 每个 job 独立维持在途 I/O 数
+```
+
+#### 架构图解
+
+```
+--numjobs=4 --iodepth=8：
+
+  Job 1（线程/进程 1）
+  ├─ I/O 1 ─┐
+  ├─ I/O 2 ─┤
+  ├─ ...     ├─ 8 个在途 I/O
+  └─ I/O 8 ─┘
+
+  Job 2（线程/进程 2）
+  ├─ I/O 1 ─┐
+  ├─ I/O 2 ─┤
+  ├─ ...     ├─ 8 个在途 I/O
+  └─ I/O 8 ─┘
+
+  Job 3、Job 4 同上...
+
+  ★ 总并发 I/O = 4 × 8 = 32 个同时在途
+```
+
+#### 源码验证
+
+```c
+// init.c:1965-1972 — numjobs 通过克隆 job 实现
+numjobs = o->numjobs;
+while (--numjobs) {
+    struct thread_data *td_new = get_new_job(false, td, true, jobname);
+    td_new->o.numjobs = 1;       // ★ 子 job 的 numjobs 设为 1，避免递归
+    td_new->subjob_number = numjobs;
+    add_job(td_new, jobname, numjobs, 1, client_type);
+}
+
+// backend.c:2802-2806 — 每个 job 创建独立线程
+if (td->o.use_thread)
+    ret = pthread_create(&td->thread, NULL, thread_main, fd);
+
+// options.c:3193-3201 — numjobs 定义
+{
+    .name = "numjobs",
+    .help = "Duplicate this job this many times",
+    .def  = "1",              // ★ 默认值 = 1（不复制）
+}
+
+// options.c:2427-2437 — iodepth 定义
+{
+    .name = "iodepth",
+    .help = "Number of IO buffers to keep in flight",
+    .def  = "1",              // ★ 默认值 = 1（串行 I/O）
+}
+```
+
+#### 对 IOPS 的影响
+
+| 配置 | 总并发 I/O | IOPS（SSD 示例） | 说明 |
+|------|----------|----------------|------|
+| `numjobs=1, iodepth=1` | 1 | ~15K | 串行，最低 IOPS |
+| `numjobs=1, iodepth=32` | 32 | ~350K | 单 job 高并发 |
+| `numjobs=4, iodepth=8` | 32 | ~340K | 总并发相同，但多 job 有锁开销 |
+| `numjobs=4, iodepth=32` | 128 | ~400K | ★ 并发翻倍，IOPS 继续增长 |
+| `numjobs=32, iodepth=32` | 1024 | ~380K | ★ 过多 job 导致竞争，IOPS 反降 |
+
+#### ★ 关键区别：numjobs 增加有额外开销
+
+```
+iodepth 增加：
+  → 仅增加单个 job 内部的在途 I/O 数
+  → 无额外线程/进程开销
+  → ★ 推荐优先用 iodepth 提升并发度
+
+numjobs 增加：
+  → 创建独立的线程/进程
+  → 每个 job 有独立的：内存分配、io_context、文件描述符
+  → 多 job 竞争同一设备 → accept/IO 锁竞争
+  → ★ 适用于模拟多用户/多应用并发场景
+```
+
+#### 使用场景对照
+
+| 场景 | 推荐配置 | 原因 |
+|------|---------|------|
+| **测试设备最大 IOPS** | `numjobs=1, iodepth=128` | 单 job 高并发，无多进程竞争 |
+| **模拟数据库** | `numjobs=8, iodepth=32` | 模拟多个 DB worker 线程 |
+| **测试延迟** | `numjobs=1, iodepth=1` | 完全串行，测真实设备延迟 |
+| **压力测试** | `numjobs=16, iodepth=64` | 最大化并发，压满设备 |
+
+**一句话总结：** numjobs = "几个人同时干活"（作业级并发），iodepth = "每个人手里同时拿着几个任务"（I/O 级并发）。总并发 = numjobs × iodepth。优先用 iodepth 提升并发度，numjobs 用于模拟多用户场景。
+
+---
+
+## Q8: 为什么 fio 用 libaio 引擎时必须加 --direct=1？
+
+**日期：** 2026-07-04
+**场景：** 使用 `fio --ioengine=libaio --iodepth=32` 但没有加 `--direct=1`，发现 IOPS 远低于预期，iodepth 似乎不起作用
+**相关文件：** `docs/fio/reading/04_backend_do_io.c`
+**源码位置：** `src/fio/engines/libaio.c:325-343`（io_submit 调用）、`src/linux-5.10/mm/filemap.c:2503-2553`（IOCB_DIRECT 分支）、`src/linux-5.10/fs/aio.c:1496-1513`（aio_rw_done）
+
+### 回答
+
+**★ libaio + buffered IO（无 direct=1）时，内核在 io_submit() 中同步完成 I/O，iodepth 形同虚设。加 direct=1 才能实现真正的异步 I/O。**
+
+#### 问题现象
+
+```bash
+# 没有 direct=1 — iodepth 不起作用
+fio --ioengine=libaio --iodepth=32 --rw=randread --bs=4k --filename=/dev/vdb
+# IOPS ≈ 15K（等同于 iodepth=1 的 sync 引擎！）
+
+# 加了 direct=1 — iodepth 正常工作
+fio --ioengine=libaio --iodepth=32 --direct=1 --rw=randread --bs=4k --filename=/dev/vdb
+# IOPS ≈ 350K（真正的异步并发）
+```
+
+#### 根因：内核的 IOCB_DIRECT 分支
+
+```c
+// mm/filemap.c:2503-2553 — generic_file_read_iter()
+ssize_t generic_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+    if (iocb->ki_flags & IOCB_DIRECT) {
+        // ★ O_DIRECT 路径：调用驱动的 direct_IO，真正异步
+        retval = mapping->a_ops->direct_IO(iocb, iter);
+        // → 返回 -EIOCBQUEUED → I/O 真正在后台执行
+        // ...
+    }
+
+    // ★ 非 O_DIRECT 路径：走 buffered read，同步完成！
+    retval = generic_file_buffered_read(iocb, iter, retval);
+    // → 在当前线程中同步读取 page cache
+    // → io_submit() 期间 I/O 就完成了
+}
+```
+
+```c
+// fs/aio.c:1496-1513 — aio_rw_done()
+static inline void aio_rw_done(struct kiocb *req, ssize_t ret)
+{
+    switch (ret) {
+    case -EIOCBQUEUED:
+        break;            // ★ 异步：I/O 已排队，等完成回调
+    default:
+        req->ki_complete(req, ret, 0);  // ★ 同步：I/O 已完成，立即回调
+    }
+}
+```
+
+#### 流程对比图
+
+```
+buffered IO（无 direct=1）：
+
+  fio: io_submit(iocb_1, iocb_2, ..., iocb_32)
+       │
+       ├─ 内核 generic_file_read_iter()
+       │  └─ IOCB_DIRECT 未设置 → generic_file_buffered_read()
+       │     └─ 同步从 page cache 读取 → I/O 1 完成 ✓
+       │  └─ 同理 I/O 2~32 全部同步完成 ✓
+       │
+       └─ io_submit() 返回时，32 个 I/O 已经全部完成！
+          ★ 实际是串行处理，iodepth 无意义
+
+O_DIRECT（direct=1）：
+
+  fio: io_submit(iocb_1, iocb_2, ..., iocb_32)
+       │
+       ├─ 内核 generic_file_read_iter()
+       │  └─ IOCB_DIRECT 设置 → mapping->a_ops->direct_IO()
+       │     └─ 提交到块设备驱动 → 返回 -EIOCBQUEUED
+       │  └─ 32 个 I/O 全部排队到设备 ← ★ 真正并发！
+       │
+       └─ io_submit() 立即返回
+          fio: io_getevents() 等待完成通知
+```
+
+#### fio 的 libaio 引擎不检查 direct
+
+```c
+// engines/libaio.c:458-464 — libaio 引擎标志
+FIO_STATIC struct ioengine_ops ioengine = {
+    .name = "libaio",
+    .flags = FIO_ASYNCIO_SYNC_TRIM |
+             FIO_ASYNCIO_SYNC_SYNCFS |
+             FIO_ASYNCIO_SETS_ISSUE_TIME |
+             FIO_ATOMICWRITES,
+    // ★ 注意：没有 FIO_SYNCIO 标志！
+    // fio 认为 libaio 是异步引擎，不会警告 iodepth 问题
+};
+
+// engines/libaio.c:267-297 — fio_libaio_queue() 总是返回 FIO_Q_QUEUED
+static enum fio_q_status fio_libaio_queue(struct thread_data *td,
+                                          struct io_u *io_u)
+{
+    // ...
+    ld->iocbs[ld->head] = &io_u->iocb;
+    ring_inc(ld, &ld->head, 1);
+    ld->queued++;
+    return FIO_Q_QUEUED;  // ★ 告诉 fio"I/O 已排队"
+                           // 但实际 buffered IO 在 io_submit 时已同步完成
+}
+```
+
+#### 官方示例验证
+
+```bash
+# fio 官方 aio 示例也用了 buffered=0（等价于 direct=1）
+# src/fio/examples/aio-read.fio
+[global]
+ioengine=libaio
+buffered=0       # ★ buffered=0 等价于 direct=1
+rw=randread
+bs=128k
+```
+
+#### 解决方案
+
+```bash
+# ★ 方案 1（推荐）：加 direct=1
+fio --ioengine=libaio --direct=1 --iodepth=32 ...
+
+# ★ 方案 2：如果必须测 buffered IO，改用 io_uring 引擎
+fio --ioengine=io_uring --iodepth=32 ...
+# io_uring 在 buffered IO 下也能实现真正的异步
+
+# ★ 方案 3：用 sync 引擎测 buffered IO（接受 iodepth=1）
+fio --ioengine=sync --iodepth=1 ...
+# 明确知道是同步 I/O，不设虚假的 iodepth
+```
+
+#### 各引擎 + direct 对照
+
+| 引擎 | direct=1 | direct=0 | 说明 |
+|------|----------|----------|------|
+| **libaio** | ★ 真正异步，iodepth 生效 | ⚠️ 实质同步，iodepth 无效 | 必须加 direct=1 |
+| **io_uring** | ★ 真正异步 | ★ 也支持异步 | 不需要 direct=1 |
+| **sync** | 无意义 | 无意义 | 总是同步，iodepth=1 |
+| **posixaio** | ★ 真正异步 | ⚠️ 可能同步 | 推荐加 direct=1 |
+
+**一句话总结：** Linux AIO（libaio）的设计只保证 O_DIRECT 路径下的真正异步。不加 `direct=1` 时，内核在 `io_submit()` 中同步完成 I/O，iodepth 形同虚设。这是内核 `generic_file_read_iter()` 的代码逻辑决定的，不是 fio 的 bug。
 
 ---
 
