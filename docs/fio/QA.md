@@ -164,87 +164,77 @@ fio --verify=crc32c --verify_offset=64 --rw=write --bs=4k --size=10M --filename=
 
 ### 回答
 
-**fio 不精确维持 iodepth，而是采用批量提交 + 批量收割的水位线策略，在 iodepth_low ~ iodepth 之间波动。**
+**默认情况下 fio 精确维持 cur_depth ≈ iodepth。只有显式配置 batch 参数时才会出现波动。**
 
-#### 核心机制：提交-收割循环
-
-```
-iodepth = 32 (上限)
-iodepth_low = 4 (下限，默认 = iodepth 的 1/8 或 1)
-
-               提交阶段                     收割阶段
-         ┌─────────────────┐        ┌─────────────────┐
-cur_depth: 0→4→8→...→32 满！ 32→28→24→...→4 停！
-         │  get_io_u()     │        │ wait_for_       │
-         │  td_io_queue()  │        │ completions()   │
-         │  cur_depth++    │        │ cur_depth--     │
-         └─────────────────┘        └─────────────────┘
-```
-
-#### 三个关键函数
-
-**1. `queue_full()` — 什么时候算"满"？**
+#### 关键源码：iodepth_low 的默认值
 
 ```c
-// io_u.c:1745
-bool queue_full(const struct thread_data *td)
-{
-    return io_u_qempty(&td->io_u_freelist);
-    // ★ 空闲 io_u 池为空 → 所有 iodepth 个 io_u 都在飞
-}
+// init.c:810
+if (o->iodepth_low > o->iodepth || !o->iodepth_low)
+    o->iodepth_low = o->iodepth;    // ★ 默认 iodepth_low = iodepth！
 ```
 
-io_u 池大小 = iodepth。池空 = 在飞数达到上限。
-
-**2. `do_io()` 主循环 — 提交还是收割？**
+这意味着默认的收割循环只执行 1 次就停止：
 
 ```c
-// backend.c:1365
-reap:
-    full = queue_full(td) || (ret == FIO_Q_BUSY && td->cur_depth);
-    if (full)
-        ret = wait_for_completions(td, &comp_time);
-        // ★ 满了 → 收割
+// backend.c:424 — wait_for_completions()
+do {
+    ret = io_u_queued_complete(td, min_evts);  // 收割 min_evts 个（默认 1）
+} while (full && (td->cur_depth > td->o.iodepth_low));
+//  cur_depth(31) > iodepth_low(32) → false → 立即停止！
 ```
 
-**3. `wait_for_completions()` — 收割到什么时候停？**
+#### 默认行为（无 batch 参数）：精确维持
 
-```c
-// backend.c:424
-static int wait_for_completions(struct thread_data *td, ...)
-{
-    do {
-        ret = io_u_queued_complete(td, min_evts);
-        // → engine->getevents() 收割完成的 I/O
-        // → put_io_u() → cur_depth--
-    } while (full && (td->cur_depth > td->o.iodepth_low));
-    //         ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-    //         关键：不收割到 cur_depth-1 就停，
-    //         而是持续收割直到 cur_depth <= iodepth_low！
-}
+```
+默认值：
+  iodepth = 32
+  iodepth_low = 32        ← 默认等于 iodepth
+  iodepth_batch_complete_min = 1  ← 每次只收割 1 个
+
+cur_depth
+ 32 │ ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■  ← 几乎恒定！
+    │     reap 1个       reap 1个
+    │     ↓ 立刻补1个     ↓ 立刻补1个
+ 31 │     ■               ■
+    └──────┴───────────────┴────────────────
 ```
 
-#### 时序图（iodepth=4, iodepth_low=1）
+→ **收割 1 个，提交 1 个，cur_depth 始终 ≈ iodepth。`iodepth` 参数名不误导。**
+
+#### 配置 batch 参数后：才会波动
+
+```bash
+fio --iodepth=32 --iodepth_batch_complete_min=8 --iodepth_low=4
+```
 
 ```
 cur_depth
-    4 │ ■■■■                    ■■■■
-    3 │    ↓ reap                ↓ reap
-    2 │    reap                  reap
-    1 │    reap → 停!            reap → 停!
-    0 │
-      └────┴───────┴───────┴───────
-      提交  收割  提交  收割  提交
+ 32 │ ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■  满！
+    │ ↓ 一次收割 8 个
+ 24 │ ■■■■■■■■■■■■■■■■■■■■■■■■■■
+    │ ↓ 继续收割（cur_depth > iodepth_low=4）
+  4 │ ■■■■  ← 停！（cur_depth <= iodepth_low）
+    │ ↓ 回去批量提交
+ 32 │ ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■  又满了
 ```
 
-#### 为什么不精确保持 iodepth？
+#### 三种模式对比
+
+| 配置 | 实际行为 | iodepth 参数是否"误导" |
+|------|---------|----------------------|
+| 默认（无 batch） | cur_depth ≈ iodepth，恒定 | ❌ 不误导，符合预期 |
+| `iodepth_batch_complete_min=8` | cur_depth 在 low~high 波动 | ⚠️ 用户需理解 batch 含义 |
+| `iodepth_low=4` | cur_depth 降到 4 才停收割 | ⚠️ 用户主动配置的 |
+
+#### 为什么提供 batch 参数？
 
 | 方案 | 优点 | 缺点 |
 |------|------|------|
-| 精确保持 iodepth | 恒定并发度 | 每完成 1 个就要提交 1 个，系统调用开销大 |
-| **水位线策略（fio）** | 批量提交+收割，减少系统调用 | 在飞数在 low~high 之间波动 |
+| 精确维持（默认） | 恒定并发度，符合直觉 | 每完成 1 个就调用 1 次 getevents，系统调用多 |
+| 批量收割（batch） | 减少系统调用开销 | 在飞数波动，实际平均 QD < iodepth |
 
-fio 选择了**吞吐优先**：`io_getevents(min, max)` 一次收割多个，减少系统调用开销。
+高 IOPS 场景（>500K）下，系统调用开销显著，batch 模式可提升吞吐 5-10%。
 
 ---
 
