@@ -135,8 +135,8 @@ syscall_entering_trace() 检查 traced(tcp)
 
 > ★ **重要理解：** 过滤只影响"输出"，不影响"追踪"。
 > 所有 syscall 仍然触发 ptrace 停止，只是不匹配的不会打印。
-> 这是 strace 性能开销大的根本原因之一。
-> `--seccomp` 选项可以在内核侧跳过停止，大幅降低开销。
+> 这是 ★ strace 性能开销大的根本原因之一。
+> ★ `--seccomp` 选项可以在内核侧跳过停止，大幅降低开销。
 
 ---
 
@@ -211,9 +211,9 @@ strace -c -e trace=file ls /tmp      # 只统计文件相关 syscall
 ```
 列名        │ 含义                          │ 源码位置
 ───────────┼──────────────────────────────┼───────────────────────
-% time     │ 该 syscall 占总耗时的百分比   │ count.c: CSC_TIME_100S
-seconds    │ 该 syscall 的总耗时（秒）     │ count.c: CSC_TIME_TOTAL
-usecs/call │ 平均每次调用耗时（微秒）      │ count.c: CSC_TIME_AVG
+★ % time     │ 该 syscall 占总耗时的百分比   │ count.c: CSC_TIME_100S
+★ seconds    │ 该 syscall 的总耗时（秒）     │ count.c: CSC_TIME_TOTAL
+★ usecs/call │ 平均每次调用耗时（微秒）      │ count.c: CSC_TIME_AVG
 calls      │ 调用次数                      │ count.c: CSC_CALLS
 errors     │ 返回错误的次数                │ count.c: CSC_ERRORS
 syscall    │ 系统调用名称                  │ count.c: CSC_SC_NAME
@@ -241,11 +241,11 @@ struct call_counts {
 ```
 选项    │ 输出格式                      │ 示例
 ───────┼──────────────────────────────┼────────────────────────
--t      │ HH:MM:SS                     │ 14:30:25 execve(...)
--tt     │ HH:MM:SS.microseconds        │ 14:30:25.123456 execve(...)
--ttt    │ epoch_seconds.microseconds   │ 1719993025.123456 execve(...)
--r      │ 相对上一行的时间间隔          │ 0.000123 execve(...)
--T      │ 每次 syscall 耗时（追加）     │ execve(...) = 0 <0.000608>
+★ -t      │ HH:MM:SS                     │ 14:30:25 execve(...)
+★ -tt     │ HH:MM:SS.microseconds        │ 14:30:25.123456 execve(...)
+★ -ttt    │ epoch_seconds.microseconds   │ 1719993025.123456 execve(...)
+★ -r      │ 相对上一行的时间间隔          │ 0.000123 execve(...)
+★ -T      │ 每次 syscall 耗时（追加）     │ execve(...) = 0 <0.000608>
 ```
 
 > `-t`/`-tt`/`-ttt` 和 `-r` 可以组合使用，但 `-T` 是独立追加的列。
@@ -327,13 +327,13 @@ strace -f -ff -o trace ls /tmp
 ### 场景 8：故障注入（测试错误处理）
 
 ```bash
-# 让 openat 总是返回 ENOENT
+# ★ 让 openat 总是返回 ENOENT
 strace -e inject=openat:error=ENOENT cat /etc/hosts
 
-# 让 50% 的 read 返回 EIO
+# ★ 让 50% 的 read 返回 EIO
 strace -e inject=read:error=EIO:when=2+2 cat /etc/hosts
 
-# 让 write 延迟 100ms
+# ★ 让 write 延迟 100ms
 strace -e inject=write:delay_enter=100ms echo "hello"
 ```
 
@@ -353,12 +353,12 @@ strace -p $(pidof myapp) -f
 ### 场景 10：seccomp 优化（减少开销）
 
 ```bash
-# 使用 seccomp 过滤减少 ptrace 开销
+# ★ 使用 seccomp 过滤减少 ptrace 开销
 strace --seccomp -e trace=file ls /tmp
 
 # 对比：普通模式 vs seccomp 模式
 time strace -c ls /tmp              # 普通模式
-time strace --seccomp -c ls /tmp    # seccomp 模式（更快）
+time strace --seccomp -c ls /tmp    # ★ seccomp 模式（更快）
 ```
 
 ### 场景 11：查看环境变量
@@ -423,16 +423,16 @@ grep -n "sysent0\|SEN_" src/strace/src/linux/x86_64/syscallent.h | head -20
 ```
 目的                    │ 命令
 ───────────────────────┼──────────────────────────────────────────────
-快速诊断启动问题       │ strace -e trace=file,openat <command>
+★ 快速诊断启动问题       │ strace -e trace=file,openat <command>
 找出 ENOENT 错误       │ strace -e status=failed <command>
-分析耗时分布           │ strace -c -S time <command>
+★ 分析耗时分布           │ strace -c -S time <command>
 追踪网络行为           │ strace -e trace=network <command>
 追踪子进程树           │ strace -f -e trace=process <command>
 追踪特定文件           │ strace -P /path/to/file <command>
 带时间戳输出到文件     │ strace -tt -o trace.log <command>
 每个 syscall 耗时       │ strace -T <command>
-减少追踪开销           │ strace --seccomp -e trace=file <command>
+★ 减少追踪开销           │ strace --seccomp -e trace=file <command>
 附加到进程追踪网络     │ strace -f -e trace=network -p <PID>
-故障注入测试           │ strace -e inject=openat:error=ENOENT <command>
+★ 故障注入测试           │ strace -e inject=openat:error=ENOENT <command>
 显示 fd 对应路径       │ strace -y -e trace=desc <command>
 ```

@@ -142,7 +142,300 @@
   └──────────────────────────────────────────┘
 ```
 
-### 2.3 ★ 核心要点：CCD 内的核 vs 跨 CCD 的核
+### 2.3 ★ Linux 内核如何检测 AMD CCD/CCX 拓扑（源码佐证）
+
+内核在 `init_amd()` 初始化流程中依次调用拓扑检测函数：
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/amd.c:974-981 */
+/* init_amd() 中的调用链 —— ★ AMD 拓扑检测的入口 */
+
+	cpu_detect_cache_sizes(c);
+
+	amd_detect_cmp(c);       /* ① 通过 APIC ID 位域检测 core/socket */
+	amd_get_topology(c);     /* ② CPUID 0x8000001e 解析节点/CCD 拓扑 */
+	srat_detect_node(c);     /* ③ SRAT 表关联 NUMA node */
+	amd_detect_ppin(c);      /* ④ PPIN（Protected Processor ID） */
+
+	init_amd_cacheinfo(c);   /* ⑤ 缓存层级初始化 */
+```
+
+---
+
+**① `amd_detect_cmp()` —— 基于 APIC ID 的基础拓扑检测：**
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/amd.c:385-397 */
+/*
+ * On a AMD dual core setup the lower bits of the APIC id
+ * distinguish the cores. Assumes number of cores is a power of two.
+ */
+static void amd_detect_cmp(struct cpuinfo_x86 *c)
+{
+	unsigned bits;
+	int cpu = smp_processor_id();
+
+	bits = c->x86_coreid_bits;
+	/* ★ APIC ID 低位 = core_id（核心在 socket 内的编号） */
+	c->cpu_core_id = c->initial_apicid & ((1 << bits) - 1);
+	/* ★ APIC ID 高位 = socket ID（物理处理器编号） */
+	c->phys_proc_id = c->initial_apicid >> bits;
+	/* socket ID 也用作 LLC（末级缓存）标识 */
+	per_cpu(cpu_llc_id, cpu) = c->phys_proc_id;
+}
+/*
+ * ★ 原理：APIC ID 的二进制编码包含了拓扑信息
+ *   例如 64 核 EPYC（每 CCD 8 核，8 CCD）:
+ *   APIC ID = [socket_id | ccd_id | core_in_ccd | smt_id]
+ *   x86_coreid_bits 决定了核心编号占用的位数
+ */
+```
+
+---
+
+**② `amd_get_topology()` —— 通过 CPUID 0x8000001E 解析 CCD/节点拓扑：**
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/amd.c:331-379 */
+/*
+ * Fixup core topology information for
+ * (1) AMD multi-node processors
+ * (2) AMD processors supporting compute units
+ */
+static void amd_get_topology(struct cpuinfo_x86 *c)
+{
+	u8 node_id;
+	int cpu = smp_processor_id();
+
+	/* ★ 检查 CPU 是否支持 Topology Extensions（CPUID 0x8000001E） */
+	if (boot_cpu_has(X86_FEATURE_TOPOEXT)) {
+		int err;
+		u32 eax, ebx, ecx, edx;
+
+		cpuid(0x8000001e, &eax, &ebx, &ecx, &edx);
+
+		/* ECX[7:0] = 内部节点 ID（对应 NUMA node） */
+		node_id = ecx & 0xff;
+
+		/* Fam15h (Bulldozer 系列): EBX[7:0] = Compute Unit ID */
+		if (c->x86 == 0x15)
+			c->cu_id = ebx & 0xff;
+
+		/* ★ Fam17h+ (Zen 系列): EBX[7:0] = Core ID */
+		if (c->x86 >= 0x17) {
+			c->cpu_core_id = ebx & 0xff;
+			/* 如果启用了 SMT，需要除以每核线程数 */
+			if (smp_num_siblings > 1)
+				c->x86_max_cores /= smp_num_siblings;
+		}
+
+		/* 尝试使用 CPUID leaf 0xb/0x1f 获取更精细的拓扑层级 */
+		err = detect_extended_topology(c);
+		if (!err)
+			c->x86_coreid_bits =
+				get_count_order(c->x86_max_cores);
+
+		/* ★ 设置 LLC ID —— 决定哪些核共享同一 L3 Cache */
+		cacheinfo_amd_init_llc_id(c, cpu, node_id);
+
+	/* 旧处理器回退路径：从 MSR 读取节点 ID */
+	} else if (cpu_has(c, X86_FEATURE_NODEID_MSR)) {
+		u64 value;
+		rdmsrl(MSR_FAM10H_NODE_ID, value);
+		node_id = value & 7;
+		per_cpu(cpu_llc_id, cpu) = node_id;
+	}
+
+	/* ★ 多节点处理器标记（NPS > 1 时生效） */
+	if (nodes_per_socket > 1) {
+		set_cpu_cap(c, X86_FEATURE_AMD_DCM);
+		legacy_fixup_core_id(c);
+	}
+}
+```
+
+---
+
+**③ SMT 线程数检测与 TOPOEXT 特性恢复：**
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/amd.c:734-749 */
+/* early_init_amd() 中的 TOPOEXT 处理 */
+
+	/* 如果 BIOS 关闭了 TopologyExtensions，尝试重新启用 */
+	if (c->x86 == 0x15 &&
+	    (c->x86_model >= 0x10 && c->x86_model <= 0x6f) &&
+	    !cpu_has(c, X86_FEATURE_TOPOEXT)) {
+		if (msr_set_bit(0xc0011005, 54) > 0) {
+			rdmsrl(0xc0011005, value);
+			if (value & BIT_64(54)) {
+				set_cpu_cap(c, X86_FEATURE_TOPOEXT);
+				pr_info_once("CPU: Re-enabling disabled "
+				  "Topology Extensions Support.\n");
+			}
+		}
+	}
+
+	/* ★ CPUID 0x8000001E EBX[15:8] = ThreadsPerCore - 1 */
+	/* 这就是内核判断每核有几个 SMT 线程的地方 */
+	if (cpu_has(c, X86_FEATURE_TOPOEXT))
+		smp_num_siblings =
+			((cpuid_ebx(0x8000001e) >> 8) & 0xff) + 1;
+```
+
+---
+
+**④ `nodes_per_socket` —— 每 socket 的 NUMA 节点数（NPS 配置的硬件基础）：**
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/amd.c:36-41, 569-578 */
+
+/* 全局变量：每 socket 的节点数，默认 1（即 NPS1） */
+/*
+ * nodes_per_socket: Stores the number of nodes per socket.
+ * Refer to Fam15h Models 00-0fh BKDG - CPUID Fn8000_001E_ECX
+ * Node Identifiers[10:8]
+ */
+static u32 nodes_per_socket = 1;
+
+/* early_init_amd() 中解析： */
+	if (boot_cpu_has(X86_FEATURE_TOPOEXT)) {
+		u32 ecx;
+		/* ★ CPUID 0x8000001E ECX[10:8] = NodesPerSocket - 1 */
+		ecx = cpuid_ecx(0x8000001e);
+		nodes_per_socket = ((ecx >> 8) & 7) + 1;
+	} else if (boot_cpu_has(X86_FEATURE_NODEID_MSR)) {
+		u64 value;
+		/* 旧处理器：从 MSR_FAM10H_NODE_ID 读取 */
+		rdmsrl(MSR_FAM10H_NODE_ID, value);
+		nodes_per_socket = ((value >> 3) & 7) + 1;
+	}
+```
+
+---
+
+**⑤ `X86_FEATURE_TOPOEXT` 特性位定义：**
+
+```c
+/* 源码位置：arch/x86/include/asm/cpufeatures.h:180 */
+#define X86_FEATURE_TOPOEXT  (6*32+22) /* Topology extensions CPUID leafs */
+/*
+ * ★ 该特性位表示 CPU 支持 CPUID 0x8000001E leaf
+ *   这是 AMD 处理器拓扑枚举的"开关"：
+ *   - 有此特性 → 可用 CPUID 0x8000001E 获取 core_id、node_id、线程数
+ *   - 无此特性 → 回退到 MSR_FAM10H_NODE_ID 等旧方法
+ *   AMD Family 15h (Bulldozer) 开始引入，Zen 系列全面支持
+ */
+```
+
+---
+
+**⑥ `detect_extended_topology()` —— 通用 x86 拓扑层级解析（CPUID leaf 0xb/0x1f）：**
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/topology.c:92-155 */
+int detect_extended_topology(struct cpuinfo_x86 *c)
+{
+	unsigned int eax, ebx, ecx, edx, sub_index;
+	unsigned int ht_mask_width, core_plus_mask_width,
+		     die_plus_mask_width;
+	unsigned int core_select_mask, core_level_siblings;
+	unsigned int die_select_mask, die_level_siblings;
+	int leaf;
+
+	/* ★ 优先使用 leaf 0x1f（V2 拓扑），回退到 leaf 0xb */
+	leaf = detect_extended_topology_leaf(c);
+	if (leaf < 0)
+		return -1;
+
+	/* sub-leaf 0: SMT 层级 */
+	cpuid_count(leaf, SMT_LEVEL, &eax, &ebx, &ecx, &edx);
+	c->initial_apicid = edx;
+	core_level_siblings =
+		smp_num_siblings = LEVEL_MAX_SIBLINGS(ebx);
+	core_plus_mask_width =
+		ht_mask_width = BITS_SHIFT_NEXT_LEVEL(eax);
+
+	/* 遍历后续 sub-leaf，找 Core 和 Die 层级 */
+	sub_index = 1;
+	do {
+		cpuid_count(leaf, sub_index, &eax, &ebx, &ecx, &edx);
+
+		if (LEAFB_SUBTYPE(ecx) == CORE_TYPE) {
+			core_level_siblings =
+				LEVEL_MAX_SIBLINGS(ebx);
+			core_plus_mask_width =
+				BITS_SHIFT_NEXT_LEVEL(eax);
+		}
+		/* ★ leaf 0x1f 新增 DIE_TYPE，区分 die 和 package */
+		if (LEAFB_SUBTYPE(ecx) == DIE_TYPE) {
+			die_level_siblings =
+				LEVEL_MAX_SIBLINGS(ebx);
+			die_plus_mask_width =
+				BITS_SHIFT_NEXT_LEVEL(eax);
+		}
+		sub_index++;
+	} while (LEAFB_SUBTYPE(ecx) != INVALID_TYPE);
+
+	/* ★ 通过位掩码从 APIC ID 中提取 core_id 和 die_id */
+	core_select_mask =
+		(~(-1 << core_plus_mask_width)) >> ht_mask_width;
+	die_select_mask =
+		(~(-1 << die_plus_mask_width)) >> core_plus_mask_width;
+
+	c->cpu_core_id = apic->phys_pkg_id(c->initial_apicid,
+				ht_mask_width) & core_select_mask;
+	c->cpu_die_id = apic->phys_pkg_id(c->initial_apicid,
+				core_plus_mask_width) & die_select_mask;
+	c->phys_proc_id = apic->phys_pkg_id(c->initial_apicid,
+				die_plus_mask_width);
+
+	/* ★ 最终计算: 每 package 核心数 = 线程总数 / SMT 线程数 */
+	c->x86_max_cores =
+		(core_level_siblings / smp_num_siblings);
+	__max_die_per_package =
+		(die_level_siblings / core_level_siblings);
+
+	return 0;
+}
+/*
+ * ★ CPUID leaf 0xb/0x1f 层级类型定义:
+ *   SMT_TYPE  = 1   → SMT 线程层级
+ *   CORE_TYPE = 2   → 物理核心层级
+ *   DIE_TYPE  = 5   → Die 层级（仅 leaf 0x1f 支持）
+ *
+ *   AMD Zen 处理器的 APIC ID 编码:
+ *   ┌──────────┬────────┬───────────┬─────────┐
+ *   │ Socket ID│ Die ID │ Core ID   │ SMT ID  │
+ *   └──────────┴────────┴───────────┴─────────┘
+ *   detect_extended_topology() 就是按层级解析这个编码
+ */
+```
+
+---
+
+```
+  ★ CPUID 0x8000001E 寄存器解码总结（AMD PPR 规范）:
+
+  EAX[31:0]  = Extended APIC ID（扩展 APIC 标识符）
+  EBX[7:0]   = CoreId（核心 ID，Zen 系列使用）
+  EBX[15:8]  = ThreadsPerCore - 1（每核线程数 - 1）
+  ECX[7:0]   = NodeId（内部节点 ID，对应 NUMA node）
+  ECX[10:8]  = NodesPerSocket - 1（每 socket 节点数 - 1）
+
+  ★ 完整调用链:
+  early_init_amd()
+  ├─ 读取 CPUID 0x8000001E → smp_num_siblings（SMT 线程数）
+  └─ 读取 CPUID 0x8000001E → nodes_per_socket（NPS 配置）
+  init_amd()
+  ├─ amd_detect_cmp()        → cpu_core_id, phys_proc_id（APIC ID 位域）
+  ├─ amd_get_topology()      → core_id, node_id（CPUID 0x8000001E）
+  │   ├─ detect_extended_topology() → die_id, core_id（CPUID 0xb/0x1f）
+  │   └─ cacheinfo_amd_init_llc_id() → cpu_llc_id（LLC 共享关系）
+  └─ init_amd_cacheinfo()    → 缓存层级枚举（CPUID 0x8000001D）
+```
+
+### 2.4 ★ 核心要点：CCD 内的核 vs 跨 CCD 的核
 
 | 通信场景 | 路径 | 近似延迟 | 说明 |
 |---------|------|---------|------|
@@ -184,7 +477,73 @@
   └────────────────────────────────────────────────┘
 ```
 
-### 3.2 32MB L3 的实际含义
+### 3.2 ★ 内核如何确定 LLC 共享关系（源码佐证）
+
+内核通过 `cacheinfo_amd_init_llc_id()` 确定哪些核心共享同一 L3 Cache，
+这是调度器将线程聚集到同一 CCD 的关键依据：
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/cacheinfo.c:649-685 */
+void cacheinfo_amd_init_llc_id(struct cpuinfo_x86 *c,
+				int cpu, u8 node_id)
+{
+	/* 检查是否有 L3 Cache（CPUID 0x80000006 EDX != 0） */
+	if (!cpuid_edx(0x80000006))
+		return;
+
+	if (c->x86 < 0x17) {
+		/*
+		 * ★ Fam15h/16h（Bulldozer/Jaguar 时代）:
+		 *   LLC 在 NUMA node 级别 —— 同一 node 共享 L3
+		 */
+		per_cpu(cpu_llc_id, cpu) = node_id;
+
+	} else if (c->x86 == 0x17 && c->x86_model <= 0x1F) {
+		/*
+		 * ★ Fam17h 早期（Zen 1/Zen 2，Naples/Rome）:
+		 *   LLC 在 Core Complex 级别
+		 *   Core Complex ID = APIC ID 右移 3 位
+		 *   → 每 8 个 APIC ID 编号为一组（对应 1 个 CCX/CCD）
+		 */
+		per_cpu(cpu_llc_id, cpu) = c->apicid >> 3;
+
+	} else {
+		/*
+		 * ★ Fam19h+（Zen 3/Zen 4，Milan/Genoa）:
+		 *   从 CPUID 0x8000001D 读取共享该缓存的线程数
+		 *   然后用 APIC ID 右移计算 LLC ID
+		 */
+		u32 eax, ebx, ecx, edx;
+		u32 num_sharing_cache = 0;
+		u32 llc_index = find_num_cache_leaves(c) - 1;
+
+		cpuid_count(0x8000001d, llc_index,
+			    &eax, &ebx, &ecx, &edx);
+		if (eax)
+			/* EAX[25:14] = NumSharingCache - 1 */
+			num_sharing_cache =
+				((eax >> 14) & 0xfff) + 1;
+
+		if (num_sharing_cache) {
+			int bits = get_count_order(
+					num_sharing_cache);
+			/* ★ APIC ID >> bits = LLC ID */
+			/* 例如 8 线程共享 → bits=3 → APIC[7:3] */
+			per_cpu(cpu_llc_id, cpu) =
+				c->apicid >> bits;
+		}
+	}
+}
+/*
+ * ★ 三代 Zen 的 LLC ID 计算方式演进:
+ *   Zen 1/2: 硬编码 apicid >> 3（假设每 CCD 8 线程）
+ *   Zen 3+:  从 CPUID 动态获取共享线程数，更通用
+ *   → 这样即使未来 CCD 核心数变化（如 Zen 5 的 16 核 CCD），
+ *     内核也能正确识别 LLC 边界
+ */
+```
+
+### 3.3 32MB L3 的实际含义
 
 | 场景 | 32MB L3 是否足够 | 说明 |
 |------|-----------------|------|

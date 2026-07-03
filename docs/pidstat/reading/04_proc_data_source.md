@@ -125,8 +125,9 @@ $ getconf CLK_TCK
 **★ 关键结论**：CLK_TCK = 100，即 1 clock_t = 10ms（1/100 秒）。
 
 ```
-utime = 905 clock_t = 905 / 100 = 9.05 秒的用户态 CPU 时间
-stime = 1071 clock_t = 1071 / 100 = 10.71 秒的内核态 CPU 时间
+utime = 998 clock_t = 998 / 100 = 9.98 秒的用户态 CPU 时间
+stime = 1154 clock_t = 1154 / 100 = 11.54 秒的内核态 CPU 时间
+CPU 总时间 = 9.98 + 11.54 = 21.52 秒
 
 pidstat %CPU 计算公式：
   %usr = (utime_T2 - utime_T1) / (interval × CLK_TCK) × 100
@@ -410,7 +411,7 @@ nvcswch/s     │ /proc/[pid]/status    │ nonvoluntary_ctxt_sw  │ Δnvcswch/
 ```bash
 # 第一步：读取 /proc/1/stat 原始数据
 $ cat /proc/1/stat | awk '{print "utime=" $14, "stime=" $15, "cpu=" $39}'
-utime=905 stime=1071 cpu=0
+utime=998 stime=1154 cpu=1
 
 # 第二步：确认 CLK_TCK
 $ getconf CLK_TCK
@@ -421,20 +422,21 @@ $ pidstat -u -p 1 1 1
 ```
 
 ```
-Linux 5.10.x    2026-07-04     _x86_64_    (4 CPU)
+Linux 6.6.102-5.3.1.alnx4.x86_64 (iZbp11r90r4g931c0wfjt5Z) 	07/04/2026 	_x86_64_	(4 CPU)
 
-时间        UID      PID    %usr %system  %guest   %wait   %CPU   CPU  Command
-...
-平均:       0        1      0.00    0.00    0.00    0.00    0.00   -   systemd
+12:53:05 AM   UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+12:53:06 AM     0         1    0.00    0.00    0.00    0.00    0.00     1  systemd
+Average:        0         1    0.00    0.00    0.00    0.00    0.00     -  systemd
 ```
 
 **对照分析：**
 
 ```
 /proc/1/stat 原始值：
-  utime = 905 clock_t = 9.05 秒（从进程启动至今的用户态时间）
-  stime = 1071 clock_t = 10.71 秒（内核态时间）
-  CPU 总时间 = 9.05 + 10.71 = 19.76 秒
+  utime = 998 clock_t = 9.98 秒（从进程启动至今的用户态时间）
+  stime = 1154 clock_t = 11.54 秒（内核态时间）
+  CPU 总时间 = 9.98 + 11.54 = 21.52 秒
+  最近运行 CPU = 1（字段 39）
 
 pidstat 输出 %usr = 0.00 的原因：
   1 秒采样期内，systemd(PID 1) 几乎没有消耗 CPU

@@ -614,6 +614,49 @@ void __init check_bugs(void)
 
 ### 4.4 数据依赖与调度
 
+> **内核源码佐证：** 内核通过 `get_cpu_cap()` 读取 CPUID 获取 CPU 的全部能力信息，
+> 这些信息直接反映了乱序执行引擎能利用的指令级并行度（ILP）：
+
+```c
+/* 源码位置：src/linux-5.10/arch/x86/kernel/cpu/common.c:898
+ *
+ * ★ get_cpu_cap() — 通过 CPUID 指令枚举 CPU 特性
+ *   这是内核了解 CPU 乱序执行能力（支持哪些指令、有多少功能单元）的入口。
+ *   每个 CPUID 叶节点对应不同的特性类别。
+ */
+void get_cpu_cap(struct cpuinfo_x86 *c)
+{
+    u32 eax, ebx, ecx, edx;
+
+    /* CPUID 0x01: 基础特性（FPU, SSE, SSE2, HT, ...） */
+    if (c->cpuid_level >= 0x00000001) {
+        cpuid(0x00000001, &eax, &ebx, &ecx, &edx);
+        c->x86_capability[CPUID_1_ECX] = ecx;  /* ★ SSE3, SSSE3, SSE4, AVX, AES... */
+        c->x86_capability[CPUID_1_EDX] = edx;  /* ★ FPU, TSC, CMOV, MMX, HT... */
+    }
+
+    /* CPUID 0x07: 扩展特性（AVX2, AVX-512, BMI, ...） */
+    if (c->cpuid_level >= 0x00000007) {
+        cpuid_count(0x00000007, 0, &eax, &ebx, &ecx, &edx);
+        c->x86_capability[CPUID_7_0_EBX] = ebx; /* ★ AVX2, BMI1/2, MPX... */
+        c->x86_capability[CPUID_7_ECX] = ecx;
+        c->x86_capability[CPUID_7_EDX] = edx;
+    }
+
+    /* AMD 扩展特性（0x80000001）: SYSCALL, NX, 大页... */
+    if (eax >= 0x80000001) {
+        cpuid(0x80000001, &eax, &ebx, &ecx, &edx);
+        c->x86_capability[CPUID_8000_0001_ECX] = ecx;
+        c->x86_capability[CPUID_8000_0001_EDX] = edx; /* ★ SYSCALL, NX, LM(64-bit) */
+    }
+
+    /* ★ 推测执行控制特性（Spectre 缓解相关） */
+    init_speculation_control(c);
+
+    apply_forced_caps(c);  /* 应用内核命令行强制/禁用的特性 */
+}
+```
+
 | 依赖类型 | 示例 | 能否乱序 | 处理方式 |
 |---------|------|---------|---------|
 | RAW (Read After Write) | A: R1=X, B: Y=R1 | 不能 | 真依赖，B 必须等 A 完成 |
@@ -993,3 +1036,52 @@ do {                                          \
 | ILP | Instruction-Level Parallelism | 指令级并行度 |
 | MLP | Memory-Level Parallelism | 内存级并行度 |
 | LLC | Last-Level Cache | 最后一级缓存（通常指 L3） |
+
+---
+
+## 8. 内核源码索引
+
+> 以下是本文引用的所有内核源码文件及其与 CPU 微架构概念的对应关系：
+
+| 微架构概念 | 内核源码路径 | 关键函数/定义 |
+|-----------|-------------|-------------|
+| 指令集特性（流水线 Decode/Execute） | `arch/x86/include/asm/cpufeatures.h` | `X86_FEATURE_*` 宏（~200 个特性位） |
+| 推测执行控制（分支预测安全） | `arch/x86/include/asm/msr-index.h` | `MSR_IA32_SPEC_CTRL`, `SPEC_CTRL_IBRS/STIBP/SSBD` |
+| 硬件漏洞免疫标志 | `arch/x86/include/asm/msr-index.h` | `MSR_IA32_ARCH_CAPABILITIES`, `ARCH_CAP_*` |
+| CPU 信息结构体 | `arch/x86/include/asm/processor.h` | `struct cpuinfo_x86`（缓存/拓扑/特性） |
+| CPUID 特性枚举 | `arch/x86/kernel/cpu/common.c:898` | `get_cpu_cap()` |
+| 缓存大小探测 | `arch/x86/kernel/cpu/common.c:690` | `cpu_detect_cache_sizes()` |
+| TLB 探测与输出 | `arch/x86/kernel/cpu/common.c:737` | `cpu_detect_tlb()` |
+| 超线程检测 | `arch/x86/kernel/cpu/common.c:774` | `detect_ht()` |
+| 推测执行控制初始化 | `arch/x86/kernel/cpu/common.c:857` | `init_speculation_control()` |
+| CPU 识别总流程 | `arch/x86/kernel/cpu/common.c:1500` | `identify_cpu()` |
+| 硬件漏洞缓解入口 | `arch/x86/kernel/cpu/bugs.c:79` | `check_bugs()` |
+| SPEC_CTRL 虚拟化 | `arch/x86/kernel/cpu/bugs.c:156` | `x86_virt_spec_ctrl()` |
+| SMP 拓扑映射 | `arch/x86/kernel/smpboot.c:567` | `set_cpu_sibling_map()` |
+| 内存屏障（x86 TSO） | `arch/x86/include/asm/barrier.h` | `mb()`, `rmb()`, `wmb()`, `__smp_*` |
+| 推测执行屏障 | `arch/x86/include/asm/barrier.h:52` | `barrier_nospec()` |
+
+```
+  ★ 内核 CPU 初始化总流程（与本文各章节的对应关系）:
+
+  start_kernel()
+    └── check_bugs()                          ← 【第3章】Spectre/Meltdown 缓解
+         ├── identify_boot_cpu()
+         │    └── identify_cpu()               ← 【第5章】CPU 识别总入口
+         │         ├── generic_identify()
+         │         │    ├── get_cpu_cap()      ← 【第1/4章】CPUID 枚举特性
+         │         │    │    └── init_speculation_control() ← 【第3章】推测执行
+         │         │    ├── cpu_detect_cache_sizes() ← 【第2章】缓存探测
+         │         │    └── cpu_detect_tlb()   ← 【第2章】TLB 探测
+         │         ├── this_cpu->c_identify()  ← 厂商特定识别（intel.c / amd.c）
+         │         └── detect_ht()             ← 【第5章】超线程检测
+         ├── rdmsrl(MSR_IA32_SPEC_CTRL)       ← 【第3章】读取推测控制 MSR
+         ├── spectre_v2_select_mitigation()   ← 【第3章】选择缓解策略
+         └── arch_smt_update()                ← 【第5章】根据 SMT 更新缓解
+
+  SMP 启动（AP 核初始化）:
+    └── set_cpu_sibling_map()                 ← 【第5章】建立拓扑关系
+         ├── match_smt()  → topology_sibling_cpumask  (thread_siblings)
+         ├── match_llc()  → cpu_llc_shared_mask       (core_siblings)
+         └── match_pkg() → topology_core_cpumask      (package)
+```

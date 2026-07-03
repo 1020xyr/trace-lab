@@ -879,8 +879,8 @@ ls /sys/fs/fuse/connections/39/
 | 文件 | 含义 | 典型值 |
 |------|------|--------|
 | `waiting` | 等待用户态处理的请求数 | 0（正常）/ >0（积压） |
-| `max_background` | 最大后台请求数 | 12（默认） |
-| `congestion_threshold` | 拥塞阈值 | 9（默认，= max_background × 75%） |
+| `max_background` | 最大后台请求数 | ★ 12（默认） |
+| `congestion_threshold` | 拥塞阈值 | ★ 9（默认，= max_background × 75%） |
 | `abort` | 强制终止连接 | 写入 `1` 触发 |
 
 ```bash
@@ -956,19 +956,19 @@ echo "mount_max = 10" | tee -a /etc/fuse.conf
 // src/linux-5.10/fs/fuse/fuse_i.h
 
 // 默认最大后台请求数
-#define FUSE_DEFAULT_MAX_BACKGROUND     12
+#define FUSE_DEFAULT_MAX_BACKGROUND     ★ 12
 
 // 默认拥塞阈值（= max_background × 75%）
 #define FUSE_DEFAULT_CONGESTION_THRESHOLD  (FUSE_DEFAULT_MAX_BACKGROUND * 75 / 100)
 
 // FUSE 请求最大页数
-#define FUSE_MAX_MAX_PAGES              256   // 256 × 4KB = 1MB
+#define FUSE_MAX_MAX_PAGES              ★ 256   // 256 × 4KB = 1MB
 
 // 默认每请求最大页数
-#define FUSE_DEFAULT_MAX_PAGES_PER_REQ  32    // 32 × 4KB = 128KB
+#define FUSE_DEFAULT_MAX_PAGES_PER_REQ  ★ 32    // 32 × 4KB = 128KB
 
 // /dev/fuse 最小读缓冲区
-#define FUSE_MIN_READ_BUFFER            8192  // 8KB
+#define FUSE_MIN_READ_BUFFER            ★ 8192  // 8KB
 ```
 
 ---

@@ -154,7 +154,7 @@ signal(sig, target)             # 发送信号（需 --unsafe）
 ### ★ A. 进程与系统调用追踪
 
 ```bash
-# 1. 统计各进程的系统调用次数
+# ★ 1. 统计各进程的系统调用次数
 bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
 
 # 2. 统计各进程的系统调用次数（按系统调用名分组）
@@ -175,7 +175,7 @@ bpftrace -e 'tracepoint:syscalls:sys_enter_kill { printf("%s -> pid=%d sig=%d\n"
 # 7. 追踪用户切换（上下文切换）
 bpftrace -e 'tracepoint:sched:sched_switch { @[args->prev_comm] = count(); }'
 
-# 8. 查看系统调用延迟分布
+# ★ 8. 查看系统调用延迟分布
 bpftrace -e '
   tracepoint:raw_syscalls:sys_enter { @start[tid] = nsecs; }
   tracepoint:raw_syscalls:sys_exit /@start[tid]/ {
@@ -217,13 +217,13 @@ bpftrace -e 'kprobe:vfs_unlink { printf("unlink: %s\n", comm); }'
 ### ★ C. Block I/O 追踪（与 blktrace 对照）
 
 ```bash
-# 16. 统计各进程的 block I/O 次数
+# ★ 16. 统计各进程的 block I/O 次数
 bpftrace -e 'tracepoint:block:block_rq_issue { @[comm] = count(); }'
 
 # 17. 统计 block I/O 大小分布
 bpftrace -e 'tracepoint:block:block_rq_issue { @bytes = hist(args->bytes); }'
 
-# 18. block I/O 延迟分布（D2C）
+# ★ 18. block I/O 延迟分布（D2C）
 bpftrace -e '
   tracepoint:block:block_rq_issue { @start[args->sector] = nsecs; }
   tracepoint:block:block_rq_complete /@start[args->sector]/ {
@@ -244,7 +244,7 @@ bpftrace -e 'tracepoint:block:block_rq_issue { @[args->dev] = sum(args->bytes); 
 bpftrace -e 'tracepoint:block:block_rq_complete /args->errors/ { printf("I/O error: dev=%d sector=%d err=%d\n", args->dev, args->sector, args->errors); }'
 ```
 
-### D. 网络追踪
+### ★ D. 网络追踪
 
 ```bash
 # 23. 统计 TCP connect 调用
@@ -262,10 +262,10 @@ bpftrace -e 'kprobe:tcp_v4_connect { printf("TCP connect: %s\n", comm); }'
 bpftrace -e 'tracepoint:syscalls:sys_enter_sendto { printf("sendto: %s fd=%d len=%d\n", comm, args->fd, args->addrlen); }'
 ```
 
-### E. 性能分析
+### ★ E. 性能分析
 
 ```bash
-# 27. CPU 火焰图数据（off-CPU 分析）
+# ★ 27. CPU 火焰图数据（off-CPU 分析）
 bpftrace -e '
   profile:hz:99 /pid > 0/ {
     @[kstack] = count();
@@ -290,7 +290,7 @@ bpftrace -e '
     @[comm, kstack(5)] = count();
   }'
 
-# 31. 调度延迟分析
+# ★ 31. 调度延迟分析
 bpftrace -e '
   tracepoint:sched:sched_switch { @runq[args->next_pid] = nsecs; }
   tracepoint:sched:sched_wakeup /@runq[args->pid]/ {
@@ -307,7 +307,7 @@ bpftrace -e '
   }'
 ```
 
-### F. 安全与诊断
+### ★ F. 安全与诊断
 
 ```bash
 # 33. 追踪 setuid 调用
@@ -316,7 +316,7 @@ bpftrace -e 'tracepoint:syscalls:sys_enter_setuid { printf("setuid: %s uid=%d\n"
 # 34. 追踪模块加载
 bpftrace -e 'kprobe:do_init_module { printf("module load: %s\n", str(arg0)); }'
 
-# 35. 追踪 OOM killer
+# ★ 35. 追踪 OOM killer
 bpftrace -e 'kprobe:oom_kill_process { printf("OOM kill triggered by %s\n", comm); }'
 ```
 
@@ -329,7 +329,7 @@ bpftrace -e 'kprobe:oom_kill_process { printf("OOM kill triggered by %s\n", comm
 ```bash
 #!/usr/bin/bpftrace
 /*
- * syscount.bt — 统计系统调用次数
+ * ★ syscount.bt — 统计系统调用次数
  *
  * 用法：bpftrace syscount.bt
  *       bpftrace syscount.bt -p <PID>
@@ -357,9 +357,9 @@ END
 ```bash
 #!/usr/bin/bpftrace
 /*
- * biolatency.bt — Block I/O 延迟直方图
+ * ★ biolatency.bt — Block I/O 延迟直方图
  *
- * 对标 blktrace + btt 的 D2C 延迟分析
+ * ★ 对标 blktrace + btt 的 D2C 延迟分析
  * 用法：bpftrace biolatency.bt
  */
 
@@ -441,7 +441,7 @@ bpftool <对象> <命令> [选项]
 ### 5.2 prog — BPF 程序管理
 
 ```bash
-# 列出所有已加载的 BPF 程序
+# ★ 列出所有已加载的 BPF 程序
 bpftool prog show
 # 输出示例：
 # 33: kprobe  name do_sys_openat2  tag abc123  gpl

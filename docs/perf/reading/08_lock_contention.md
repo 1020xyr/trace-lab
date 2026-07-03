@@ -472,6 +472,84 @@ do {                                            \
 ★ 细粒度锁                │ 大锁拆分为多个小锁      │ 中
 ```
 
+#### ★ 源码：qrwlock 读写锁 —— 读不互斥的实现
+
+```c
+/* 源码位置：src/linux-5.10/include/asm-generic/qrwlock_types.h:13-27 */
+
+/*
+ * ★ 队列读写锁的数据结构
+ *   由一个 32-bit 计数器 + 一个 qspinlock 组成
+ */
+typedef struct qrwlock {
+    union {
+        atomic_t cnts;          /* ★ 读写状态计数器 */
+        struct {
+#ifdef __LITTLE_ENDIAN
+            u8 wlocked;         /* 字节 0：写锁标志（0 或 0xff） */
+            u8 __lstate[3];     /* 字节 1-3：读锁计数 */
+#endif
+        };
+    };
+    arch_spinlock_t wait_lock;  /* 内部的自旋锁（写者排队用） */
+} arch_rwlock_t;
+
+/*
+ * ★ 位域含义：
+ *   _QW_LOCKED  = 0x0ff  → 写锁被持有
+ *   _QW_WAITING = 0x100  → 有写者在等待
+ *   _QR_SHIFT   = 9      → 读者计数从 bit 9 开始
+ *   _QR_BIAS    = (1<<9) → 每个读者原子加 0x200
+ *
+ *   读锁快速路径：原子加 _QR_BIAS，检查无写者 → 直接返回
+ *   写锁快速路径：CAS 把 0 改为 _QW_LOCKED → 直接返回
+ */
+```
+
+```c
+/* 源码位置：src/linux-5.10/include/asm-generic/qrwlock.h:72-82 */
+
+/*
+ * ★ 读锁获取 —— 快速路径（无写者时零开销）
+ */
+static inline void queued_read_lock(struct qrwlock *lock)
+{
+    u32 cnts;
+
+    /* ★ 原子增加读者计数（_QR_BIAS = 1 << 9） */
+    cnts = atomic_add_return_acquire(_QR_BIAS, &lock->cnts);
+    if (likely(!(cnts & _QW_WMASK)))
+        return;   /* ★ 无写者 → 直接获取读锁，多个读者可并行 */
+
+    /* 有写者 → 进入慢路径（可能需要等待写者释放） */
+    queued_read_lock_slowpath(lock);
+}
+```
+
+```c
+/* 源码位置：src/linux-5.10/include/asm-generic/qrwlock.h:88-96 */
+
+/*
+ * ★ 写锁获取 —— 必须等待所有读者释放
+ */
+static inline void queued_write_lock(struct qrwlock *lock)
+{
+    u32 cnts = 0;
+    /* ★ 快速路径：CAS 把 0 改为 _QW_LOCKED
+     *   成功条件：当前无读者且无写者 */
+    if (likely(atomic_try_cmpxchg_acquire(&lock->cnts, &cnts, _QW_LOCKED)))
+        return;
+
+    /* 快速路径失败 → 慢路径排队等待 */
+    queued_write_lock_slowpath(lock);
+}
+```
+
+> **rwlock vs spinlock 的 perf 表现差异**：
+> - rwlock 在读多写少场景下，读者走快速路径（原子加法），**不会进入 slowpath**
+> - 因此 `perf top` 中 rwlock 相关函数出现频率远低于 spinlock
+> - 但如果写者频繁，rwlock 的争用同样会出现在 `queued_write_lock_slowpath` 中
+
 ---
 
 ## 总结
@@ -497,9 +575,21 @@ perf lock report -s caller --stdio        │ 按调用路径分析
 ### 源码位置
 
 ```
-perf lock:     src/linux-5.10/tools/perf/builtin-lock.c
-内核锁实现:    src/linux-5.10/kernel/locking/spinlock.c
-               src/linux-5.10/kernel/locking/mutex.c
-               src/linux-5.10/kernel/locking/rwsem.c
-锁 tracepoint: src/linux-5.10/include/trace/events/lock.h
+perf lock:          src/linux-5.10/tools/perf/builtin-lock.c
+
+内核锁实现:
+  自旋锁入口:       src/linux-5.10/kernel/locking/spinlock.c
+  queued spinlock:  src/linux-5.10/kernel/locking/qspinlock.c       ★ 慢路径实现
+  MCS 队列节点:     src/linux-5.10/kernel/locking/mcs_spinlock.h    ★ 自旋等待核心
+  读写锁:           src/linux-5.10/kernel/locking/qrwlock.c
+  互斥锁:           src/linux-5.10/kernel/locking/mutex.c
+  读写信号量:       src/linux-5.10/kernel/locking/rwsem.c
+
+头文件（数据结构 + 快速路径）:
+  qspinlock_t:      src/linux-5.10/include/asm-generic/qspinlock_types.h  ★ 4 字节位域布局
+  qspinlock 快路径: src/linux-5.10/include/asm-generic/qspinlock.h        ★ CAS + slowpath 调用
+  qrwlock_t:        src/linux-5.10/include/asm-generic/qrwlock_types.h    ★ 读写锁结构
+  qrwlock 快路径:   src/linux-5.10/include/asm-generic/qrwlock.h          ★ 读/写锁获取
+
+锁 tracepoint:      src/linux-5.10/include/trace/events/lock.h
 ```
