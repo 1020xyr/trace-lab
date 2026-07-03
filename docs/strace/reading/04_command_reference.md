@@ -23,31 +23,31 @@ strace [选项] -p <PID>
 
 | 参数 | 含义 | 源码位置 | 默认值 |
 |------|------|---------|--------|
-| `-e trace=xxx` | 过滤要追踪的系统调用 | `filter_qualify.c: qualify_syscall()` | `trace=all` |
-| `-p PID` | 附加到运行中的进程 | `strace.c: startup_attach()` | — |
-| `-f` | 追踪 fork/clone 出的子进程 | `strace.c: followfork` + `PTRACE_O_TRACECLONE` | 不追踪 |
-| `-c` | 统计模式（只计数不输出） | `count.c: count_syscall()` + `cflag` | 关闭 |
-| `-T` | 显示每次 syscall 耗时 | `syscall.c: Tflag` + `syscall_exiting_trace()` | 关闭 |
+| ★ `-e trace=xxx` | 过滤要追踪的系统调用 | `filter_qualify.c: qualify_syscall()` | `trace=all` |
+| ★ `-p PID` | 附加到运行中的进程 | `strace.c: startup_attach()` | — |
+| ★ `-f` | 追踪 fork/clone 出的子进程 | `strace.c: followfork` + `PTRACE_O_TRACECLONE` | 不追踪 |
+| ★ `-c` | 统计模式（只计数不输出） | `count.c: count_syscall()` + `cflag` | 关闭 |
+| ★ `-T` | 显示每次 syscall 耗时 | `syscall.c: Tflag` + `syscall_exiting_trace()` | 关闭 |
 | `-t` | 显示时间戳（HH:MM:SS） | `syscall.c: tflag` | 关闭 |
 | `-tt` | 显示微秒级时间戳 | `syscall.c: tflag == 2` | 关闭 |
 | `-ttt` | 显示 epoch 微秒时间戳 | `syscall.c: tflag == 3` | 关闭 |
 | `-o file` | 输出到文件 | `strace.c: outf` + `open_file()` | stderr |
 | `-S sort` | 统计报告排序方式 | `count.c: summary_sortby` | `time` |
 | `-v` | 详细输出（不缩写） | `filter_qualify.c: verbose_set` | 缩写 |
-| `-s strsize` | 字符串最大显示长度 | `strace.c: max_strlen` | 32 |
+| `-s strsize` | 字符串最大显示长度 | `strace.c: max_strlen` | ★ 32 |
 | `-y` | 显示 fd 对应的路径 | `defs.h: show_fd_path` | 关闭 |
 | `-yy` | 显示 fd 的完整协议信息 | `defs.h: show_fd_path == 2` | 关闭 |
 | `-r` | 显示相对时间戳 | `syscall.c: rflag` | 关闭 |
 | `-x` | 十六进制显示非 ASCII 字符串 | `strace.c: xflag` | 关闭 |
 | `-xx` | 十六进制显示所有字符串 | `strace.c: xflag == 2` | 关闭 |
-| `-P path` | 只追踪访问指定路径的 syscall | `pathtrace.c: pathtrace_match()` | — |
-| `--seccomp` | 启用 seccomp 内核侧过滤 | `filter_seccomp.c` | 关闭 |
+| ★ `-P path` | 只追踪访问指定路径的 syscall | `pathtrace.c: pathtrace_match()` | — |
+| ★ `--seccomp` | 启用 seccomp 内核侧过滤 | `filter_seccomp.c` | 关闭 |
 
 ### 进阶参数
 
 | 参数 | 含义 | 源码位置 |
 |------|------|---------|
-| `-e inject=xxx` | 故障注入（篡改 syscall 返回值） | `syscall.c: tamper_with_syscall_entering()` |
+| ★ `-e inject=xxx` | 故障注入（篡改 syscall 返回值） | `syscall.c: tamper_with_syscall_entering()` |
 | `-e signal=xxx` | 追踪指定信号 | `filter_qualify.c: signal_set` |
 | `-e status=xxx` | 按返回状态过滤输出 | `filter_qualify.c: status_set` |
 | `-e quiet=xxx` | 抑制特定信息 | `filter_qualify.c: quiet_set` |
@@ -55,7 +55,7 @@ strace [选项] -p <PID>
 | `-e write=fd` | 显示写入指定 fd 的数据 | `util.c: dumpio` |
 | `-D` | 在独立子进程中运行 tracer | `strace.c: daemonized_tracer` |
 | `-I ms` | 中断延迟（用于调试） | `strace.c: interrupt_timeout` |
-| `--kill-on-exit` | strace 退出时杀死所有 tracee | `strace.c: PTRACE_O_EXITKILL` |
+| ★ `--kill-on-exit` | strace 退出时杀死所有 tracee | `strace.c: PTRACE_O_EXITKILL` |
 | `--syscall-limit=N` | 追踪 N 个 syscall 后分离 | `strace.c: syscall_limit` |
 
 ---
@@ -69,17 +69,17 @@ strace [选项] -p <PID>
 ```
 分类关键字     │ 对应标志位         │ 包含的系统调用
 ──────────────┼───────────────────┼────────────────────────────────────────────
-file           │ TRACE_FILE        │ openat, read, write, close, stat, chmod,
+★ file           │ TRACE_FILE        │ openat, read, write, close, stat, chmod,
                │  (000000001)      │ chown, link, symlink, rename, mkdir, ...
                │                   │ （所有涉及文件名/路径的 syscall）
-network        │ TRACE_NETWORK     │ socket, connect, bind, listen, accept,
+★ network        │ TRACE_NETWORK     │ socket, connect, bind, listen, accept,
                │  (000000004)      │ sendto, recvfrom, sendmsg, recvmsg,
                │                   │ setsockopt, getsockopt, ...
-process        │ TRACE_PROCESS     │ clone, fork, vfork, execve, exit,
+★ process        │ TRACE_PROCESS     │ clone, fork, vfork, execve, exit,
                │  (000000010)      │ wait4, kill, getpid, getppid, ...
 signal         │ TRACE_SIGNAL      │ kill, tkill, tgkill, sigaction,
                │  (000000020)      │ sigprocmask, signalfd, rt_sigreturn, ...
-desc           │ TRACE_DESC        │ read, write, pread, pwrite, select,
+★ desc           │ TRACE_DESC        │ read, write, pread, pwrite, select,
                │  (000000040)      │ poll, epoll, close, dup, fcntl, ...
 ipc            │ TRACE_IPC         │ msgget, msgsnd, msgrcv, semget,
                │  (000000002)      │ semop, shmget, shmat, shmdt, ...
@@ -99,7 +99,7 @@ strace -e trace=file,network curl http://example.com
 # 单个系统调用名
 strace -e trace=openat,read,write cat /etc/hosts
 
-# 否定（排除某些 syscall）
+# ★ 否定（排除某些 syscall）
 strace -e trace='!mmap,mprotect,munmap' ls /tmp
 
 # 全部（默认值）
@@ -133,7 +133,7 @@ syscall_entering_trace() 检查 traced(tcp)
                   ★ 但仍用 PTRACE_SYSCALL 继续追踪（不停止追踪！）
 ```
 
-> **重要理解：** 过滤只影响"输出"，不影响"追踪"。
+> ★ **重要理解：** 过滤只影响"输出"，不影响"追踪"。
 > 所有 syscall 仍然触发 ptrace 停止，只是不匹配的不会打印。
 > 这是 strace 性能开销大的根本原因之一。
 > `--seccomp` 选项可以在内核侧跳过停止，大幅降低开销。

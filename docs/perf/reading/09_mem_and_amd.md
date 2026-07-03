@@ -22,11 +22,11 @@
 ### 1.1 基本原理
 
 ```
-perf mem 使用 PEBS（Intel）或 IBS（AMD）的内存采样功能：
+perf mem 使用 ★ PEBS（Intel）或 IBS（AMD）的内存采样功能：
   → 记录每次 load/store 的：
     - 数据地址（虚拟 + 物理）
-    - 延迟（从发起访问到完成的周期数）
-    - 数据来源（L1/L2/L3/Local DRAM/Remote DRAM）
+    - ★ 延迟（从发起访问到完成的周期数）
+    - ★ 数据来源（L1/L2/L3/Local DRAM/Remote DRAM）
     - 访问类型（load/store）
 
 源码：src/linux-5.10/tools/perf/builtin-mem.c
@@ -53,12 +53,12 @@ perf mem report 输出列：
 
 字段              │ 含义                          │ 诊断要点
 ─────────────────┼──────────────────────────────┼──────────────────
-Symbol           │ 函数名                        │ 热点函数
+Symbol           │ 函数名                        │ ★ 热点函数
 DSO              │ 所属共享库                    │ —
-TLB              │ TLB 命中情况                  │ miss → 大页优化
-Cache            │ 缓存命中层级                  │ L1/L2/L3/DRAM
+TLB              │ TLB 命中情况                  │ ★ miss → 大页优化
+Cache            │ 缓存命中层级                  │ ★ L1/L2/L3/DRAM
 Mem              │ 内存类型                      │ —
-Snoop            │ 是否需要 cache 一致性交互     │ HITM → false sharing
+Snoop            │ 是否需要 cache 一致性交互     │ ★ HITM → false sharing
 Cycles           │ 访问延迟（CPU 周期）          │ ★ 越高越慢
 
 ★ 数据来源层级：
@@ -105,12 +105,12 @@ perf mem report --sort=mem,snoop --stdio
 ```
 perf 事件名           │ Intel 映射                    │ AMD 映射
 ─────────────────────┼──────────────────────────────┼──────────────────────
-cycles                │ CPU_CLK_UNHALTED.THREAD_P    │ cpu cycles unhalted
-instructions          │ INST_RETIRED.ANY             │ retired instructions
-cache-references      │ LONGEST_LAT_CACHE.REFERENCE  │ L3 cache access
-cache-misses          │ LONGEST_LAT_CACHE.MISS       │ L3 cache miss
-branches              │ BR_INST_RETIRED.ALL_BRANCHES │ retired branch instr
-branch-misses         │ BR_MISP_RETIRED.ALL_BRANCHES │ retired mispredict branch
+★ cycles                │ CPU_CLK_UNHALTED.THREAD_P    │ cpu cycles unhalted
+★ instructions          │ INST_RETIRED.ANY             │ retired instructions
+★ cache-references      │ LONGEST_LAT_CACHE.REFERENCE  │ L3 cache access
+★ cache-misses          │ LONGEST_LAT_CACHE.MISS       │ L3 cache miss
+★ branches              │ BR_INST_RETIRED.ALL_BRANCHES │ retired branch instr
+★ branch-misses         │ BR_MISP_RETIRED.ALL_BRANCHES │ retired mispredict branch
 
 ★ 通用事件由内核自动映射，用户使用方式完全相同
 ★ 差异在内核 PMU 驱动中处理：
@@ -154,15 +154,15 @@ perf stat -e amd_df/event=0x7,umask=0x38/ ./app  # DRAM 读取
 ```
 特性                    │ Intel (Xeon)         │ AMD (EPYC)
 ───────────────────────┼─────────────────────┼─────────────────────
-L3 结构                │ 统一 LLC             │ ★ 每 CCX 独立 L3
+L3 结构                │ ★ 统一 LLC             │ ★ 每 CCX 独立 L3
                        │ 所有核心共享          │ 核心只能访问本 CCX 的 L3
-CCX / CCD             │ 不适用                │ ★ 4~8 核一个 CCX
+CCX / CCD             │ ★ 不适用                │ ★ 4~8 核一个 CCX
                        │                       │ 2~12 个 CCX 一个 CCD
-NUMA 拓扑             │ 每 socket 1 NUMA     │ ★ 每 CCD 可能 1 NUMA
+NUMA 拓扑             │ ★ 每 socket 1 NUMA     │ ★ 每 CCD 可能 1 NUMA
                        │                       │ （NPS 配置决定）
 PMC 数量               │ 4 通用 + 3 固定      │ 4~6 通用（无固定）
-精确采样               │ PEBS                 │ ★ IBS（更强大）
-L3 miss 事件          │ 全局 LLC miss        │ 按 CCX 分别统计
+精确采样               │ ★ PEBS                 │ ★ IBS（更强大）
+L3 miss 事件          │ 全局 LLC miss        │ ★ 按 CCX 分别统计
 ```
 
 ---
@@ -173,7 +173,7 @@ L3 miss 事件          │ 全局 LLC miss        │ 按 CCX 分别统计
 
 ```
 IBS（Instruction Based Sampling）是 AMD 独有的精确采样技术：
-  → 比 Intel PEBS 功能更丰富
+  → ★ 比 Intel PEBS 功能更丰富
   → 可以同时获取：
     - 指令的精确地址
     - 指令的延迟（周期数）
@@ -217,8 +217,8 @@ perf list | grep ibs
 分支信息         │ 有限                    │ ★ 完整的分支预测结果
 TLB 信息         │ 无                      │ ★ TLB 命中/miss
 数据来源         │ 缓存层级                │ ★ 缓存层级 + NUMA 节点
-采样开销         │ 低                      │ 低
-可用性           │ Intel Core 及以上       │ AMD Family 10h 及以上
+采样开销         │ 低                      │ ★ 低
+可用性           │ Intel Core 及以上       │ ★ AMD Family 10h 及以上
 
 ★ 在 AMD 上，IBS 是最强大的性能分析工具
   → 可以精确定位到每条指令的延迟来源
@@ -236,13 +236,13 @@ TLB 信息         │ 无                      │ ★ TLB 命中/miss
 AMD EPYC 的 NUMA 拓扑比 Intel 更复杂：
 
 NPS（Nodes Per Socket）配置：
-  NPS1: 1 个 NUMA 节点/socket（所有 CCD 共享）
-  NPS2: 2 个 NUMA 节点/socket
+  ★ NPS1: 1 个 NUMA 节点/socket（所有 CCD 共享）
+  ★ NPS2: 2 个 NUMA 节点/socket
   NPS4: 4 个 NUMA 节点/socket（★ 每个 CCD 一个 NUMA）
 
 ★ NPS4 性能最好但 NUMA 敏感性最高
-  → 跨 NUMA 访问延迟增加 50%~100%
-  → 必须使用 numactl 绑定进程到正确的 NUMA 节点
+  → ★ 跨 NUMA 访问延迟增加 50%~100%
+  → 必须使用 ★ numactl 绑定进程到正确的 NUMA 节点
 
 检查 NUMA 配置：
   numactl --hardware
@@ -266,9 +266,9 @@ AMD 的 L3 是 per-CCX 的（非全局共享）：
 ★ Core 0 访问 CCD 1 的 L3: 不存在！（只能访问本 CCX 的 L3）
 ★ Core 0 访问远程 DRAM: ~200 周期（经过内存控制器）
 
-→ perf stat -e cache-misses 在 AMD 上显示的是**本 CCX 的 L3 miss**
+→ ★ perf stat -e cache-misses 在 AMD 上显示的是**本 CCX 的 L3 miss**
   不像 Intel 是全局 LLC miss
-→ 这意味着 AMD 上 cache-miss 的含义不同！
+→ 这意味着 ★ AMD 上 cache-miss 的含义不同！
 ```
 
 ### 4.3 AMD 性能分析快速命令
@@ -303,10 +303,10 @@ perf c2c report --stdio
 ```
 项目              │ Intel                      │ AMD
 ─────────────────┼───────────────────────────┼──────────────────────────
-L3 结构           │ 全局共享 LLC               │ per-CCX 独立 L3
+L3 结构           │ ★ 全局共享 LLC               │ per-CCX 独立 L3
 精确采样          │ PEBS                       │ ★ IBS（更强大）
-NUMA              │ 每 socket 1 NUMA           │ 每 CCD 可配 NUMA
-cache-miss 含义   │ 全局 LLC miss              │ 本 CCX L3 miss
+NUMA              │ 每 socket 1 NUMA           │ ★ 每 CCD 可配 NUMA
+cache-miss 含义   │ 全局 LLC miss              │ ★ 本 CCX L3 miss
 原始事件编码      │ Intel SDM Vol.3B           │ AMD PPR
 PMC 数量          │ 4 通用 + 3 固定            │ 4~6 通用
 查看事件          │ perf list                  │ perf list（相同命令）

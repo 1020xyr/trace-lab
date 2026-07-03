@@ -9,7 +9,7 @@
 
 ### 1.1 fusermount / fusermount3
 
-`fusermount` 是 FUSE 文件系统的标准挂载/卸载工具，属于 setuid 程序，允许普通用户挂载 FUSE 文件系统。
+`fusermount` 是 FUSE 文件系统的标准挂载/卸载工具，属于 ★ setuid 程序，★ 允许普通用户挂载 FUSE 文件系统。
 
 ```bash
 # FUSE 2.x
@@ -26,8 +26,8 @@ fusermount3 [选项] <挂载点>
 | `-h` | 显示帮助 | 列出所有选项 |
 | `-V` | 显示版本 | 输出 fusermount 版本号 |
 | `-o <options>` | 挂载选项 | 逗号分隔的选项列表（见下方详解） |
-| `-u` | 卸载 | 卸载指定挂载点的 FUSE 文件系统 |
-| `-z` | 懒卸载（lazy） | 先从命名空间移除，待无引用后真正卸载（等价 `umount -l`） |
+| `-u` | ★ 卸载 | 卸载指定挂载点的 FUSE 文件系统 |
+| `-z` | ★ 懒卸载（lazy） | 先从命名空间移除，待无引用后真正卸载（等价 `umount -l`） |
 | `-q` | 安静模式 | 不输出警告信息 |
 
 #### `-o` 选项详解
@@ -54,21 +54,21 @@ fusermount -o async /mnt/myfs             # 异步 I/O（默认）
 # FUSE 特有选项
 fusermount -o fsname=NAME /mnt/myfs       # 设置文件系统名称（df/mount 中显示）
 fusermount -o subtype=TYPE /mnt/myfs      # 设置子类型（mount 显示为 fuse.TYPE）
-fusermount -o max_read=N /mnt/myfs        # 最大读大小（字节）
+fusermount -o ★ max_read=N /mnt/myfs        # 最大读大小（字节）
 fusermount -o max_readahead=N /mnt/myfs   # 最大预读大小（字节）
 fusermount -o umask=M /mnt/myfs           # 设置文件权限掩码
 fusermount -o uid=N /mnt/myfs             # 设置文件所有者
 fusermount -o gid=N /mnt/myfs             # 设置文件所属组
-fusermount -o entry_timeout=T /mnt/myfs   # 目录项缓存超时（秒）
-fusermount -o negative_timeout=T /mnt/myfs # 负缓存超时（不存在的文件）
-fusermount -o attr_timeout=T /mnt/myfs    # 属性缓存超时（秒）
+fusermount -o ★ entry_timeout=T /mnt/myfs   # 目录项缓存超时（秒）
+fusermount -o ★ negative_timeout=T /mnt/myfs # 负缓存超时（不存在的文件）
+fusermount -o ★ attr_timeout=T /mnt/myfs    # 属性缓存超时（秒）
 fusermount -o ac_attr_timeout=T /mnt/myfs # autocache 属性超时
-fusermount -o auto_unmount /mnt/myfs      # 进程退出时自动卸载
+fusermount -o ★ auto_unmount /mnt/myfs      # 进程退出时自动卸载
 
 # FUSE 3.x 新增选项
 fusermount3 -o auto_unmount /mnt/myfs     # 同上
 fusermount3 -o modules=M /mnt/myfs        # 加载模块（如 subdir, iconv）
-fusermount3 -o clone_fd /mnt/myfs         # 克隆 /dev/fuse fd（多线程优化）
+fusermount3 -o ★ clone_fd /mnt/myfs         # 克隆 /dev/fuse fd（多线程优化）
 ```
 
 ### 1.2 mount -t fuse 的用法
@@ -94,9 +94,9 @@ mount -t fuse myfs /mnt/myfs -o fsname=myfs,allow_other
 
 | 特性 | `mount -t fuse` | `fusermount` |
 |------|----------------|-------------|
-| 权限 | 需要 root | setuid，普通用户可用 |
+| 权限 | ★ 需要 root | ★ setuid，普通用户可用 |
 | 自动创建守护进程 | 否（需要守护进程已运行） | 否（需要守护进程自行挂载） |
-| 典型使用场景 | /etc/fstab 中自动挂载 | 手动挂载/卸载 |
+| ★ 典型使用场景 | ★ /etc/fstab 中自动挂载 | ★ 手动挂载/卸载 |
 | 选项传递 | `-o` 后直接跟 | `-o` 后直接跟 |
 
 ### 1.3 自动挂载（/etc/fstab）
@@ -146,13 +146,13 @@ umount -l /mnt/myfs
 #   ★ 调试时必加，否则看不到日志
 ./hello_fuse -f /mnt/myfs
 
-# -d : 调试模式（debug）
+# ★ -d : 调试模式（debug）
 #   隐含 -f（前台），并输出 FUSE 协议级调试信息
 #   包括每个 opcode 的参数和返回值
 ./hello_fuse -d /mnt/myfs
 
 # 等价写法
-./hello_fuse -f -o debug /mnt/myfs     # -o debug 与 -d 等价
+./hello_fuse -f -o debug /mnt/myfs     # ★ -o debug 与 -d 等价
 ```
 
 ### 2.2 `-o debug` 的含义
@@ -185,9 +185,9 @@ RELEASE 3
 
 | 选项 | 含义 | 安全影响 |
 |------|------|---------|
-| `-o allow_other` | 允许挂载者以外的用户访问 | 需 `/etc/fuse.conf` 中设置 `user_allow_other` |
+| ★ `-o allow_other` | 允许挂载者以外的用户访问 | 需 `/etc/fuse.conf` 中设置 `user_allow_other` |
 | `-o allow_root` | 仅允许 root 和挂载者访问 | 同上，比 `allow_other` 稍安全 |
-| 默认（不加） | 仅挂载者本人可访问 | 最安全的默认行为 |
+| ★ 默认（不加） | 仅挂载者本人可访问 | ★ 最安全的默认行为 |
 
 ```bash
 # 启用 allow_other 的前置条件
@@ -204,18 +204,18 @@ echo "user_allow_other" >> /etc/fuse.conf
 | `-o nonempty` | 允许挂载到非空目录 | 默认禁止挂载到非空目录 |
 | `-o max_read=N` | 限制单次最大读取字节数 | 调试时设小值观察拆包 |
 | `-o max_write=N` | 限制单次最大写入字节数 | 同上 |
-| `-o writeback_cache` | 启用写回缓存 | 写性能优化（需内核 ≥ 3.14） |
-| `-o splice_read` | 启用 splice 读（零拷贝） | 大 I/O 性能优化 |
-| `-o splice_write` | 启用 splice 写（零拷贝） | 大 I/O 性能优化 |
+| ★ `-o writeback_cache` | 启用写回缓存 | 写性能优化（需内核 ≥ 3.14） |
+| ★ `-o splice_read` | 启用 splice 读（零拷贝） | 大 I/O 性能优化 |
+| ★ `-o splice_write` | 启用 splice 写（零拷贝） | 大 I/O 性能优化 |
 | `-o no_splice_read` | 强制禁用 splice 读 | 调试/性能对比 |
 | `-o no_splice_write` | 强制禁用 splice 写 | 调试/性能对比 |
-| `-o direct_io` | 绕过 page cache | 保证数据一致性 |
-| `-o kernel_cache` | 使用内核页缓存 | 减少重复读取 |
+| ★ `-o direct_io` | 绕过 page cache | 保证数据一致性 |
+| ★ `-o kernel_cache` | 使用内核页缓存 | 减少重复读取 |
 | `-o auto_cache` | 自动管理缓存有效性 | 基于 mtime 判断缓存 |
 | `-o noforget` | 永不发送 FORGET | 调试 inode 生命周期 |
 | `-o remember=T` | inode 缓存 T 秒 | 控制缓存过期 |
 | `-o threads=N` | 多线程处理（FUSE 3.x） | 提高并发能力 |
-| `-o clone_fd` | 克隆 /dev/fuse fd | 多线程减少锁竞争 |
+| ★ `-o clone_fd` | 克隆 /dev/fuse fd | 多线程减少锁竞争 |
 
 ### 2.5 完整调试命令组合
 
@@ -457,9 +457,9 @@ struct fuse_lowlevel_ops {
 │ 路径解析             │ libfuse 自动管理      │ 用户自行管理               │
 │ inode 生命周期       │ libfuse 自动管理      │ 用户处理 FORGET            │
 │ 目录缓存             │ 由 libfuse 控制       │ 用户完全控制               │
-│ 性能                 │ 较低（路径查找开销）   │ 较高（直接 inode 操作）     │
+│ ★ 性能                 │ ★ 较低（路径查找开销）   │ ★ 较高（直接 inode 操作）     │
 │ 实现复杂度           │ 低（5-10 个回调）      │ 高（需管理 inode 表）       │
-│ 适用场景             │ 简单文件系统、原型     │ 高性能/生产级文件系统       │
+│ ★ 适用场景             │ ★ 简单文件系统、原型     │ ★ 高性能/生产级文件系统       │
 │ 代表项目             │ hello.c, sshfs        │ CephFS FUSE, GlusterFS    │
 │ 并发能力             │ 受限（路径锁）         │ 灵活（inode 级并发）        │
 │ readdirplus 支持     │ 自动（可选）           │ 需手动实现                 │
@@ -467,9 +467,9 @@ struct fuse_lowlevel_ops {
 └─────────────────────┴──────────────────────┴───────────────────────────┘
 
 选择建议：
-  - 学习 FUSE / 写原型 / 简单工具 → Highlevel API
-  - 生产级文件系统 / 需要高性能 → Lowlevel API
-  - 不确定时 → 先用 Highlevel，性能不够再迁移到 Lowlevel
+  - ★ 学习 FUSE / 写原型 / 简单工具 → Highlevel API
+  - ★ 生产级文件系统 / 需要高性能 → Lowlevel API
+  - ★ 不确定时 → 先用 Highlevel，性能不够再迁移到 Lowlevel
 ```
 
 ---
@@ -728,8 +728,8 @@ grep "iops" /tmp/ext4_result.txt | head -3
 echo "=== FUSE IOPS ==="
 grep "iops" /tmp/fuse_result.txt | head -3
 
-# 预期：FUSE 的 IOPS 下降 30-70%，延迟增加 2-5 倍
-# 原因：每次 I/O 需要 2 次额外的上下文切换（内核↔用户态）
+# 预期：★ FUSE 的 IOPS 下降 30-70%，延迟增加 2-5 倍
+# 原因：★ 每次 I/O 需要 2 次额外的上下文切换（内核↔用户态）
 
 # 清理
 fusermount -u /tmp/fuse_overlay
@@ -808,7 +808,7 @@ grep "write.*iops" /tmp/no_wbc_result.txt
 echo "=== 有 writeback_cache ==="
 grep "write.*iops" /tmp/wbc_result.txt
 
-# 预期：writeback_cache 可将写 IOPS 提升 3-10 倍
+# 预期：★ writeback_cache 可将写 IOPS 提升 3-10 倍
 # 原因：write() 直接写入 page cache，内核异步批量刷写
 
 # 清理
@@ -840,13 +840,13 @@ for layer in /mnt/ext4_base /tmp/fuse_layer1 /tmp/fuse_layer2 /tmp/fuse_layer3; 
         --runtime=5 --time_based 2>&1 | grep "iops"
 done
 
-# 预期结果：每叠加一层 FUSE，IOPS 下降约 30-50%
+# 预期结果：★ 每叠加一层 FUSE，IOPS 下降约 30-50%
 # 因为每层增加 2 次上下文切换
 #
-# ext4 直接：    ~50,000 IOPS
-# FUSE 1 层：    ~20,000 IOPS  (↓ 60%)
-# FUSE 2 层：    ~10,000 IOPS  (↓ 80%)
-# FUSE 3 层：    ~6,000 IOPS   (↓ 88%)
+# ext4 直接：    ★ ~50,000 IOPS
+# FUSE 1 层：    ★ ~20,000 IOPS  (↓ 60%)
+# FUSE 2 层：    ★ ~10,000 IOPS  (↓ 80%)
+# FUSE 3 层：    ★ ~6,000 IOPS   (↓ 88%)
 
 # 清理（从最内层开始卸载）
 fusermount -u /tmp/fuse_layer3

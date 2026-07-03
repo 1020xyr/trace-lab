@@ -40,23 +40,23 @@
   +------------------------------------------------------------+
   |                                                              |
   |  Step 1: perf stat -> IPC                                    |
-  |  +-- IPC < 1.0 -> 有大量 stall，继续                         |
-  |  +-- IPC > 2.0 -> CPU 效率高，问题可能在 I/O 或锁等待       |
+  |  +-- ★ IPC < 1.0 -> 有大量 stall，继续                         |
+  |  +-- ★ IPC > 2.0 -> CPU 效率高，问题可能在 I/O 或锁等待       |
   |                                                              |
   |  Step 2: Frontend Bound vs Backend Bound                    |
-  |  +-- Frontend > 30% -> 前端瓶颈（取指/解码）                |
-  |  +-- Backend > 50% -> 后端瓶颈（内存/执行单元），继续       |
+  |  +-- ★ Frontend > 30% -> 前端瓶颈（取指/解码）                |
+  |  +-- ★ Backend > 50% -> 后端瓶颈（内存/执行单元），继续       |
   |                                                              |
   |  Step 3: Memory Bound vs Core Bound                         |
-  |  +-- Memory > 70% of Backend -> 内存瓶颈，继续              |
-  |  +-- Core > 70% of Backend -> 执行单元/依赖链瓶颈           |
+  |  +-- ★ Memory > 70% of Backend -> 内存瓶颈，继续              |
+  |  +-- ★ Core > 70% of Backend -> 执行单元/依赖链瓶颈           |
   |                                                              |
   |  Step 4: L1/L2/L3 miss 率                                   |
-  |  +-- L3 miss > 30% -> DRAM 访问是瓶颈                      |
+  |  +-- ★ L3 miss > 30% -> DRAM 访问是瓶颈                      |
   |  +-- L1 miss 高但 L3 miss 低 -> L1 压力但 L3 兜底          |
   |                                                              |
   |  Step 5: NUMA 跨节点访问                                    |
-  |  +-- 远端访问 > 20% -> NUMA 本地性问题                      |
+  |  +-- ★ 远端访问 > 20% -> NUMA 本地性问题                      |
   |                                                              |
   +------------------------------------------------------------+
 ```
@@ -82,24 +82,24 @@ perf stat -e cycles,instructions -p <PID> sleep 10
 
 | IPC 范围 | 评价 | 含义 | 下一步 |
 |---------|------|------|--------|
-| > 3.0 | 极好 | CPU 高度利用，接近理论极限 | 问题可能不在 CPU |
+| > 3.0 | ★ 极好 | CPU 高度利用，接近理论极限 | 问题可能不在 CPU |
 | 2.0-3.0 | 良好 | 正常的高效执行 | 检查是否有 I/O 或锁等待 |
 | 1.0-2.0 | 一般 | 有一定瓶颈 | 继续 Step 2 |
 | 0.5-1.0 | 差 | 严重 stall | 继续 Step 2（高优先级） |
-| < 0.5 | 极差 | CPU 几乎空转 | 继续 Step 2（紧急） |
+| < 0.5 | ★ 极差 | CPU 几乎空转 | 继续 Step 2（紧急） |
 
 ### 2.3 IPC 与 Retiring 的关系
 
 ```
-  IPC = Retiring% x Pipeline_Width
+  ★ IPC = Retiring% x Pipeline_Width
 
   对于 4-wide 流水线 (Intel Skylake+ / AMD Zen 3+):
     IPC 2.0 = Retiring 50%  = 50% 的 Slot 被有效利用
     IPC 1.0 = Retiring 25%  = 75% 的 Slot 被浪费
     IPC 0.5 = Retiring 12.5% = 87.5% 的 Slot 被浪费
 
-  IPC < 1.0 意味着 > 75% 的 CPU 周期被浪费
-  这就是"CPU 高占用低吞吐"的本质
+  ★ IPC < 1.0 意味着 > 75% 的 CPU 周期被浪费
+  ★ 这就是"CPU 高占用低吞吐"的本质
 ```
 
 ---
@@ -131,10 +131,10 @@ perf stat -e \
 
 | 指标 | 正常 | 警告 | 严重 | 含义 |
 |------|------|------|------|------|
-| Frontend Bound | < 15% | 15-30% | > 30% | 前端无法供给足够的 uop |
-| Backend Bound | < 30% | 30-50% | > 50% | 后端无法及时消化 uop |
-| Bad Speculation | < 10% | 10-25% | > 25% | 分支预测错误浪费 |
-| Retiring | > 50% | 25-50% | < 25% | 有效工作的比例 |
+| Frontend Bound | < 15% | 15-30% | ★ > 30% | 前端无法供给足够的 uop |
+| Backend Bound | < 30% | 30-50% | ★ > 50% | 后端无法及时消化 uop |
+| Bad Speculation | < 10% | 10-25% | ★ > 25% | 分支预测错误浪费 |
+| Retiring | > 50% | 25-50% | ★ < 25% | 有效工作的比例 |
 
 ### 3.4 Frontend Bound 的常见原因
 
@@ -191,8 +191,8 @@ perf stat -e \
 
 | 瓶颈类型 | 特征 | 常见原因 |
 |---------|------|---------|
-| Memory Bound | L3 miss 率高、DRAM 带宽接近饱和 | 大数据集、随机访问、cache 污染 |
-| Core Bound | L3 miss 率低、IPC 低、无大量 cache miss | 除法运算、长依赖链、端口竞争 |
+| ★ Memory Bound | L3 miss 率高、DRAM 带宽接近饱和 | 大数据集、随机访问、cache 污染 |
+| ★ Core Bound | L3 miss 率低、IPC 低、无大量 cache miss | 除法运算、长依赖链、端口竞争 |
 
 ---
 
@@ -226,16 +226,16 @@ perf stat -e \
   L2 Misses:    30,000,000  (30% of L2)  -> 进入 L3
   L3 Misses:    10,000,000  (33% of L3)  -> 进入 DRAM
 
-  每次 DRAM 访问代价: ~200 周期 (~80ns)
+  ★ 每次 DRAM 访问代价: ~200 周期 (~80ns)
   10M 次 DRAM 访问 = 2,000,000,000 周期 = ~0.8 秒 @ 2.5GHz
 ```
 
 | 层级 | 健康 miss 率 | 问题 miss 率 | 优化方向 |
 |------|-------------|-------------|---------|
-| L1 | < 5% | > 10% | 改善数据局部性、减小工作集 |
-| L2 | < 15% | > 25% | 预取优化、数据布局调整 |
-| L3 | < 20% | > 30% | 减小总工作集、NUMA 绑定 |
-| TLB | < 1% | > 5% | 使用大页（2MB/1GB） |
+| L1 | < 5% | ★ > 10% | 改善数据局部性、减小工作集 |
+| L2 | < 15% | ★ > 25% | 预取优化、数据布局调整 |
+| L3 | < 20% | ★ > 30% | 减小总工作集、NUMA 绑定 |
+| TLB | < 1% | ★ > 5% | 使用大页（2MB/1GB） |
 
 ### 5.3 Intel Level 3 Top-Down
 
@@ -409,9 +409,9 @@ cat /proc/sys/kernel/numa_balancing
   Step 5: NUMA
     Remote RAM: 3%  -> NUMA 不是问题
 
-  根因: 数据集 200GB >> L3 32MB
+  ★ 根因: 数据集 200GB >> L3 32MB
         顺序扫描但工作集太大 -> 持续的 DRAM 访问
-  优化: 流式预取、压缩数据、增加内存带宽
+  ★ 优化: 流式预取、压缩数据、增加内存带宽
 ```
 
 ### 8.2 案例 B：随机访问型负载（哈希表/链表）
@@ -440,9 +440,9 @@ cat /proc/sys/kernel/numa_balancing
   Step 5: NUMA
     Remote RAM: 30%  -> NUMA 问题也严重
 
-  根因: 哈希表 64GB，随机访问 -> 每次查找都 miss
+  ★ 根因: 哈希表 64GB，随机访问 -> 每次查找都 miss
         + 数据分布在多个 NUMA 节点
-  优化:
+  ★ 优化:
     1. numactl 绑定到本地 NUMA 节点
     2. 分片哈希表 -> 每线程本地分片
     3. 使用 cache-oblivious 数据结构（B-tree 替代哈希表）
@@ -471,10 +471,10 @@ cat /proc/sys/kernel/numa_balancing
     vmstat: cs = 25000/s  -> 高上下文切换
     L3 miss rate: 20%  -> 中等（切换导致的 cache 污染）
 
-  根因: 全局自旋锁保护共享数据结构
+  ★ 根因: 全局自旋锁保护共享数据结构
         多线程竞争 -> 自旋等待浪费 CPU
         每次获取锁后的 cache 无效化 -> 额外的 cache miss
-  优化:
+  ★ 优化:
     1. 拆分全局锁为 per-CPU 锁
     2. 使用 RCU 替代读侧锁
     3. 减少临界区长度
@@ -529,7 +529,7 @@ perf report
 | IPC | `perf stat -e cycles,instructions` | 相同 |
 | Level 1 四大类 | `perf stat --topdown --td-level 1` | `perf stat -e stalled-cycles-*` |
 | Level 2 细分 | `perf stat --topdown --td-level 2` | `perf stat -e L1-*,LLC-*` |
-| Level 3+ 细分 | `perf stat --topdown --td-level 3` | IBS (`perf record -e ibs_op//`) |
+| Level 3+ 细分 | `perf stat --topdown --td-level 3` | ★ IBS (`perf record -e ibs_op//`) |
 | 热点函数 | `perf record -g` | 相同 |
 | 缓存竞争 | `perf c2c` | 相同 |
 | 内存访问 | `perf mem` | 相同（IBS 增强） |
@@ -542,11 +542,11 @@ perf report
 ```
   CPU 高占用低吞吐的 Top-Down 诊断:
 
-  Step 1: IPC < 1.0 -> 确认有严重 stall
-  Step 2: Backend Bound > 50% -> 后端是主要瓶颈
-  Step 3: Memory Bound -> 内存子系统问题
-  Step 4: L3 miss > 30% -> DRAM 访问是根因
-  Step 5: Remote RAM > 20% -> NUMA 加剧问题
+  ★ Step 1: IPC < 1.0 -> 确认有严重 stall
+  ★ Step 2: Backend Bound > 50% -> 后端是主要瓶颈
+  ★ Step 3: Memory Bound -> 内存子系统问题
+  ★ Step 4: L3 miss > 30% -> DRAM 访问是根因
+  ★ Step 5: Remote RAM > 20% -> NUMA 加剧问题
 
   每个 Step 都有明确的:
   - 命令（Intel + AMD 双平台）

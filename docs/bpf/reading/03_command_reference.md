@@ -19,26 +19,26 @@ bpftrace -l 'probe 模式'                # 列出可用 probe
 
 | 参数 | 含义 | 说明 |
 |------|------|------|
-| `-e 'code'` | 内联脚本 | 直接在命令行写 bpftrace 程序 |
+| `-e 'code'` | 内联脚本 | ★ 最常用，直接在命令行写 bpftrace 程序 |
 | `-l 'pattern'` | ★ 列出可用 probe | 支持通配符 `*` |
 | `-o file` | 输出到文件 | 默认输出到 stdout |
 | `-d` | 调试模式 | 输出 LLVM IR 和 BPF 字节码 |
 | `-dd` | 详细调试 | 输出未优化的 LLVM IR |
 | `-v` | 详细输出 | 显示编译器信息 |
-| `-p PID` | 附着到进程 | USDT probe 自动绑定 |
-| `-c 'cmd'` | 运行子命令 | 追踪子命令的生命周期 |
+| `-p PID` | 附着到进程 | ★ USDT probe 自动绑定 |
+| `-c 'cmd'` | 运行子命令 | ★ 追踪子命令的生命周期 |
 | `-B mode` | 缓冲模式 | `none`(无缓冲) / `line`(行缓冲) / `full`(全缓冲) |
 | `-f format` | 输出格式 | `text`(默认) / `json` |
-| `--unsafe` | 不安全模式 | 允许 system() 和 signal() |
+| `--unsafe` | 不安全模式 | ★ 允许 system() 和 signal() |
 | `--info` | 显示系统信息 | BPF 特性、内核版本等 |
-| `-k` | 保留内核帧 | kprobe 中包含内核调用栈 |
-| `-kk` | 保留所有帧 | 更详细的调用栈 |
+| `-k` | 保留内核帧 | ★ kprobe 中包含内核调用栈 |
+| `-kk` | 保留所有帧 | ★ 更详细的调用栈 |
 
 ### bpftrace -l 示例
 
 ```bash
 # 列出所有 kprobe
-bpftrace -l 'kprobe:*' | wc -l          # 约 52,000+
+bpftrace -l 'kprobe:*' | wc -l          # ★ 约 52,000+
 
 # 列出特定子系统的 tracepoint
 bpftrace -l 'tracepoint:syscalls:*'
@@ -60,7 +60,7 @@ bpftrace -l 'usdt:/path/to/binary:*'
 
 ```bash
 # 整数
-$x = 42;                # 64 位有符号整数（默认）
+$x = 42;                # ★ 64 位有符号整数（默认）
 $x = (int32)42;         # 32 位整数
 $x = (uint8)0xff;       # 8 位无符号
 
@@ -97,7 +97,7 @@ $a << $b, $a >> $b
 ### 常用函数速查
 
 ```bash
-# 输出
+# ★ 输出
 printf("format", args...);      # 格式化输出
 print(@map);                    # 打印 Map（聚合函数自动格式化）
 time("%H:%M:%S");               # 打印当前时间
@@ -107,13 +107,13 @@ str(ptr)                        # 指针 → 字符串
 str(ptr, max_len)               # 指定最大长度
 buf(ptr, len)                   # 指针 → 十六进制缓冲区
 
-# 进程信息
+# ★ 进程信息
 comm                            # 进程名
 pid                             # PID (TGID)
 tid                             # TID
 uid / gid                       # 用户/组 ID
 cpu                             # CPU 号
-nsecs                           # 纳秒时间戳
+nsecs                           # ★ 纳秒时间戳
 
 # 地址解析
 ksym(addr)                      # 内核地址 → 符号名
@@ -121,18 +121,18 @@ usym(addr)                      # 用户地址 → 符号名
 kaddr("symbol")                 # 内核符号 → 地址
 uaddr("symbol")                 # 用户符号 → 地址
 
-# 调用栈
+# ★ 调用栈
 kstack                          # 内核调用栈
 ustack                          # 用户态调用栈
 kstack(depth)                   # 限制深度
 
-# Map 聚合
+# ★ Map 聚合
 count()                         # 计数
 sum(val)                        # 求和
 avg(val)                        # 平均
 min(val) / max(val)             # 最小/最大
 stats(val)                      # count + avg + sum
-hist(val)                       # 2 的幂直方图
+hist(val)                       # ★ 2 的幂直方图
 lhist(val, min, max, step)      # 线性直方图
 
 # Map 操作
@@ -151,7 +151,7 @@ signal(sig, target)             # 发送信号（需 --unsafe）
 
 ## 三、30+ 实用 One-liners
 
-### A. 进程与系统调用追踪
+### ★ A. 进程与系统调用追踪
 
 ```bash
 # 1. 统计各进程的系统调用次数
@@ -184,7 +184,7 @@ bpftrace -e '
   }'
 ```
 
-### B. 文件 I/O 追踪
+### ★ B. 文件 I/O 追踪
 
 ```bash
 # 9. 追踪文件打开
@@ -214,7 +214,7 @@ bpftrace -e 'kprobe:do_sys_openat2 { @[str(arg1)] = count(); }'
 bpftrace -e 'kprobe:vfs_unlink { printf("unlink: %s\n", comm); }'
 ```
 
-### C. Block I/O 追踪（与 blktrace 对照）
+### ★ C. Block I/O 追踪（与 blktrace 对照）
 
 ```bash
 # 16. 统计各进程的 block I/O 次数
