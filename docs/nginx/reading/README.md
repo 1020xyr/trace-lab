@@ -10,6 +10,7 @@
 | **1** | [01_nginx_architecture.md](./01_nginx_architecture.md) | master-worker 模型、事件驱动、连接池/内存池、11 phase 流水线 | ~450 | 25 分钟 |
 | **2** | [02_command_reference.md](./02_command_reference.md) | 命令行参数、信号控制、nginx.conf 关键指令、性能调优场景 | ~450 | 20 分钟 |
 | **3** | [03_command_output_demo.md](./03_command_output_demo.md) | 实际命令执行、真实输出片段、逐行注解 | ~550 | 30 分钟 |
+| **4** | [04_performance_tuning.md](./04_performance_tuning.md) | ★ AMD CCD 绑核策略、sendfile 零拷贝、高 CPU 排查流程 | ~400 | 20 分钟 |
 
 ## 阅读建议
 

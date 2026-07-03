@@ -18,6 +18,9 @@
 | **7** | [07_engine_libaio.c](./07_engine_libaio.c) | `src/fio/engines/libaio.c` | 489 | ★ libaio 引擎 — queue/commit/getevents 异步三步曲 |
 | **8** | [08_engine_spdk.md](./08_engine_spdk.md) | — | — | SPDK 引擎介绍 — 用户态存储栈，绕过内核直接访问 NVMe |
 | **9** | [09_stat_output.md](./09_stat_output.md) | — | — | fio 输出解读 — slat/clat/lat/bw/iops 的含义和计算方式 |
+| **10** | [10_command_reference.md](./10_command_reference.md) | — | — | 完整命令参考 — 核心参数速查、10 个典型场景 |
+| **11** | [11_command_output_demo.md](./11_command_output_demo.md) | 实际执行 | — | 命令输出实战解析 — 9 个场景的真实输出 |
+| **12** | [12_best_practices.md](./12_best_practices.md) | — | — | ★ 性能基准测试最佳实践 — 延迟/吞吐/IOPS 配置、fio+blktrace 联合分析 |
 
 ---
 

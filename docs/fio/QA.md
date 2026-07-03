@@ -10,6 +10,8 @@
 - [Q2: verify_offset 和 offset 有什么区别？验证偏移的作用是什么？](#q2-verify_offset-和-offset-有什么区别验证偏移的作用是什么)
 - [Q3: fio 如何维持 iodepth？保证在途 I/O 数目的机制是什么？](#q3-fio-如何维持-iodepth保证在途-io-数目的机制是什么)
 - [Q4: rate_iops 限速机制如何工作？](#q4-rate_iops-限速机制如何工作)
+- [Q5: fio 测延迟为什么必须用 iodepth=1？](#q5-fio-测延迟为什么必须用-iodepth1)
+- [Q6: fio 的 slat/clat 与 blktrace 的 Q2D/D2C 是什么关系？](#q6-fio-的-slatclat-与-blktrace-的-q2dd2c-是什么关系)
 
 ---
 
@@ -311,6 +313,170 @@ if (should_check_rate(td))
 ```
 
 **一句话总结：** `rate_iops` 通过 `usec_for_io()` 计算每次 I/O 之间的最小间隔时间，fio 在提交前检查当前时间是否已超过 `rate_next_io_time`，未到则等待，从而实现限速。
+
+---
+
+## Q5: fio 测延迟为什么必须用 iodepth=1？
+
+**日期：** 2026-07-04  
+**场景：** 测试 NVMe SSD 延迟时用了 iodepth=32，测出 clat avg=450μs，远高于设备标称的 ~80μs  
+**相关文件：** `docs/fio/reading/12_best_practices.md`  
+**源码位置：** `src/fio/backend.c` — `do_io()` 中的 in-flight I/O 管理
+
+### 回答
+
+**★ iodepth > 1 时测的是"排队延迟"而非"设备延迟"。iodepth=1 才能测出设备的真实延迟。**
+
+#### 排队效应图解
+
+```
+iodepth=1（正确测延迟）：
+
+  I/O 1: [──── 80μs ────]
+  I/O 2:                 [──── 75μs ────]
+  I/O 3:                                [──── 85μs ────]
+  ★ 每个 I/O 独占设备，lat ≈ 设备真实延迟 = ~80μs
+
+iodepth=32（延迟被排队放大）：
+
+  32 个 I/O 同时提交：
+  I/O  1: [─── 80μs ───]
+  I/O  2: [──── 120μs ─────]  ← 等待 I/O 1 释放设备资源
+  I/O  3: [───── 180μs ──────]  ← 排队更久
+  ...
+  I/O 32: [──────────── 800μs ──────────────]  ← 排队延迟！
+  
+  ★ 平均 clat ≈ 450μs（包含了排队等待时间）
+  ★ 这不是设备真实延迟，是排队延迟
+```
+
+#### 源码视角
+
+```c
+// backend.c — do_io() 中的 iodepth 维持逻辑
+// 当 iodepth=32 时：
+//   fio 先提交 32 个 I/O，然后每完成 1 个才提交 1 个
+//   这意味着任意时刻都有 ~32 个 I/O 在设备队列中
+//
+// 设备处理 32 个并发 I/O 时：
+//   每个 I/O 的延迟 = 设备处理时间 + 排队等待时间
+//   排队等待时间 ≈ (iodepth - 1) × 单次设备处理时间 / 并行度
+```
+
+#### 正确的延迟测试配置
+
+```bash
+# ★ 延迟测试黄金配置
+fio --name=latency_test \
+    --ioengine=libaio \
+    --direct=1 \
+    --rw=randwrite \
+    --bs=4k \
+    --iodepth=1 \
+    --numjobs=1 \
+    --filename=/dev/vdb \
+    --runtime=30 \
+    --time_based
+```
+
+#### 各参数缺一不可
+
+| 参数 | 必须值 | 设错的后果 |
+|------|--------|----------|
+| `iodepth` | ★ 1 | iodepth > 1 → 排队延迟，结果偏高 3-10 倍 |
+| `numjobs` | 1 | numjobs > 1 → 多 job 竞争设备，延迟偏高 |
+| `direct` | ★ 1 | direct=0 → page cache 命中，延迟 ~0.5μs，不真实 |
+| `bs` | 4k | bs 越大 → 传输时间越长 → 延迟偏高 |
+
+**一句话总结：** iodepth=1 保证每个 I/O 独占设备资源，测出的是设备真实延迟。iodepth > 1 时多个 I/O 排队竞争，测的是排队延迟（包含了等待时间），不是设备性能指标。
+
+---
+
+## Q6: fio 的 slat/clat 与 blktrace 的 Q2D/D2C 是什么关系？
+
+**日期：** 2026-07-04  
+**场景：** 同时运行 fio + blktrace，对比 slat 和 Q2D、clat 和 D2C 时发现数值不一致  
+**相关文件：** `docs/fio/reading/09_stat_output.md`, `docs/fio/reading/12_best_practices.md`  
+**源码位置：** `src/fio/ioengines.c` — `td_io_queue()`; `src/fio/io_u.c` — `io_u_queued_complete()`
+
+### 回答
+
+**★ slat ≈ Q2D，clat ≈ D2C，lat ≈ Q2C，但不精确等价。差异来自测量视角不同（用户态 vs 内核态）。**
+
+#### 时间线对照
+
+```
+fio 用户态视角：
+  start_time ──→ issue_time ──→ complete_time
+  │←─ slat ──→│←── clat ───→│
+  │←──────── lat ──────────→│
+
+blktrace 内核视角：
+  Q (bio入队) ──→ D (下发设备) ──→ C (中断完成)
+  │←── Q2D ───→│←─── D2C ────→│
+  │←────────── Q2C ──────────→│
+```
+
+#### 精确对照表
+
+| fio 指标 | blktrace 对应 | 精确度 | 差异原因 |
+|---------|-------------|-------|---------|
+| **slat** | Q2D | ★ 近似 | slat = 用户态 get_io_u → io_submit，含 syscall 开销；Q2D = 内核 bio 入队 → 下发驱动，含 I/O 调度开销 |
+| **clat** | D2C | ★ 近似 | clat 包含完成通知延迟（中断→getevents），D2C 只到中断完成 |
+| **lat** | Q2C | ★★ 最接近 | 两者都是端到端延迟，lat 略大于 Q2C（包含用户态首尾开销） |
+
+#### 实战数据对比
+
+```
+fio 输出：
+  slat avg = 2.1μs,  clat avg = 180μs,  lat avg = 182μs
+
+btt 输出：
+  Q2D avg = 5.2μs,  D2C avg = 175.3μs,  Q2C avg = 180.5μs
+
+分析：
+  Q2D (5.2) > slat (2.1)  → 差值 3.1μs = 内核 I/O 调度开销
+  clat (180) > D2C (175.3) → 差值 4.7μs = 中断通知到用户态的开销
+  lat (182) ≈ Q2C (180.5)  → 差值 1.5μs = 用户态首尾开销
+```
+
+#### 差异的根因
+
+```
+slat vs Q2D 的差异来源：
+
+  fio:     get_io_u() → io_prep → io_submit()  ← 全在用户态
+  kernel:                                        io_submit() 进入内核
+  blktrace:                                      Q (bio 入队) → I/O 调度 → D (下发)
+  
+  ★ slat 不含内核调度时间，Q2D 含 → Q2D 通常 > slat
+  
+clat vs D2C 的差异来源：
+
+  blktrace: D (下发设备) → 设备处理 → C (中断完成)
+  kernel:                                         中断处理 → 完成 io_request
+  fio:                                            getevents() 返回 → clat 计算
+  
+  ★ clat 包含中断→用户态通知时间，D2C 不含 → clat 通常 > D2C
+```
+
+#### 如何正确使用
+
+```
+1. 评估设备性能：看 D2C（blktrace）或 clat（fio）
+   → 两者都是设备处理时间，差异 < 5% 可忽略
+   
+2. 评估全链路延迟：看 Q2C（blktrace）或 lat（fio）
+   → 两者最接近，差异 < 1%
+   
+3. 定位瓶颈层：
+   slat >> clat → 瓶颈在软件层（io_submit 慢）
+   clat >> slat → 瓶颈在设备层（设备处理慢）
+   Q2D >> D2C → 瓶颈在内核调度层（I/O 调度器开销）
+   D2C >> Q2D → 瓶颈在设备层
+```
+
+**一句话总结：** fio slat ≈ blktrace Q2D（提交延迟），fio clat ≈ blktrace D2C（设备延迟），fio lat ≈ blktrace Q2C（端到端延迟）。差异来自测量视角（用户态 vs 内核态），lat/Q2C 最接近。
 
 ---
 

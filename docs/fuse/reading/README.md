@@ -11,6 +11,9 @@
 | **2** | [02_dev_fuse_protocol.md](./02_dev_fuse_protocol.md) | 内核 `uapi/linux/fuse.h` + `fs/fuse/dev.c` | /dev/fuse 通信协议、请求/响应格式、opcode 定义 |
 | **3** | [03_hello_fuse.c](./03_hello_fuse.c) | 自编示例（参考 libfuse example） | 一个完整可编译的最小 FUSE 文件系统，逐函数注释 |
 | **4** | [04_fuse_performance.md](./04_fuse_performance.md) | 内核源码 + 性能分析 | FUSE 性能开销来源、优化手段、blktrace/strace 分析方法 |
+| **5** | [05_command_reference.md](./05_command_reference.md) | 命令参考 | fusermount/mount 参数、libfuse API、8 个常用场景命令 |
+| **6** | [06_command_output_demo.md](./06_command_output_demo.md) | 实际执行 | 8 个场景的真实输出 + 逐行注解 |
+| **7** | [07_performance_optimization.md](./07_performance_optimization.md) | ★ 深度优化 | writeback_cache 原理、splice、io_uring、诊断流程 |
 
 ## 阅读建议
 

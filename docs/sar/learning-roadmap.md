@@ -348,6 +348,32 @@ sar 发现 runq-sz > 8
 
 ---
 
+### Step 6: 性能诊断工作流 — 从 sar 到专业工具
+
+**目标：** 掌握从 sar 发现异常到用专业工具深入定位的完整流程
+
+**阅读材料：** `reading/04_diagnostic_workflow.md`
+
+**核心技能：**
+- sar 综合诊断流程（全维度扫描 → 定位异常维度 → 专业工具深入）
+- CPU 高占用低吞吐的 sar 排查（%user/%system/%soft/%iowait 分类）
+- 网络软中断 CPU 不均衡排查（sar -P ALL + sar -n EDEV）
+- sar 与 perf/bpftrace/iostat 的联动策略
+
+**诊断矩阵：**
+
+```
+sar 异常指标                    │ 深入工具
+───────────────────────────────┼──────────────────────
+%usr 高 + IPC 低              │ perf stat -d
+%sys 高 + cswch/s 高          │ perf lock + bpftrace
+%soft 高 + CPU 不均衡         │ irqbalance + RSS
+%iowait 高 + await 高         │ iostat -xz + blktrace
+runq-sz > CPU 核数            │ pidstat + ps
+```
+
+---
+
 ## 5. 动手实验清单
 
 ### 实验 1: 基础采集与查询

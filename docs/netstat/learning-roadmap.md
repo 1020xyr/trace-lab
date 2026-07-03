@@ -224,7 +224,7 @@ struct inet_diag_msg {
 
 **目标：** 掌握 netstat 和 ss 的所有常用参数
 
-**阅读材料：** `reading/03_command_reference.md`
+**阅读材料：** `reading/02_command_reference.md`
 
 **最常用的命令组合：**
 
@@ -272,7 +272,254 @@ ss -tna | awk 'NR>1{print $1}' | sort | uniq -c | sort -rn
 
 ---
 
-## 3. 核心概念索引
+## 3. ★ 网络性能诊断专题
+
+### 网络性能诊断的核心思路
+
+网络问题诊断需要**自底向上**：先看连接状态，再看中断分布，最后看协议参数。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    网络性能诊断分层                               │
+│                                                                  │
+│  第 1 层：连接状态                                               │
+│    ss -tna → TCP 状态分布、TIME_WAIT/CLOSE_WAIT 数量            │
+│    ss -s → socket 统计摘要                                       │
+│                                                                  │
+│  第 2 层：中断与 CPU                                             │
+│    /proc/interrupts → 网卡中断在各 CPU 的分布                    │
+│    mpstat -P ALL 1 → 各 CPU 的 %soft（软中断占比）              │
+│                                                                  │
+│  第 3 层：协议参数                                               │
+│    sysctl → TCP 缓冲区、拥塞算法、RPS 配置                       │
+│    netstat -s → 重传率、SYN drops、超时统计                      │
+│                                                                  │
+│  第 4 层：抓包分析                                               │
+│    tcpdump / tshark → 包级别诊断                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### ★ 网络吞吐正常但 CPU 高 — 软中断问题
+
+这是 AMD 服务器上的**高频问题场景**：网络带宽利用率正常（如 10Gbps 跑满），但 CPU 使用率异常高。
+
+```
+现象：
+  - 网络吞吐正常（带宽利用率 > 80%）
+  - CPU 使用率高（特别是 %soft 和 %system）
+  - 应用延迟不稳定
+
+诊断流程：
+  ┌──────────────────────────────────────────────────────────┐
+  │ Step 1: 确认 CPU 消耗在哪里                               │
+  │   mpstat -P ALL 1                                        │
+  │   → 看各 CPU 的 %soft 列                                │
+  │   → 如果某 CPU 的 %soft > 30%，说明软中断高              │
+  │                                                          │
+  │ Step 2: 看中断分布                                        │
+  │   cat /proc/interrupts | grep eth                        │
+  │   → 看网卡中断（如 eth0-Tx-0, eth0-Rx-0）在各 CPU 的分布│
+  │   → 如果集中在 1-2 个 CPU → ★ 中断不均衡                │
+  │                                                          │
+  │ Step 3: 判断根因                                          │
+  │   ├─ 中断集中在少数 CPU                                   │
+  │   │   → 需要 IRQ 亲和性调优或多队列网卡                   │
+  │   ├─ 中断分布均匀但 %soft 仍然高                          │
+  │   │   → 包处理量大，需要 RPS/RFS 分散软中断              │
+  │   └─ 大量小包（PPS 高但带宽不高）                         │
+  │       → 每个包的中断开销固定，小包场景 CPU 消耗大          │
+  └──────────────────────────────────────────────────────────┘
+```
+
+#### 中断分布检查
+
+```bash
+# 查看网卡中断在各 CPU 的分布
+cat /proc/interrupts | grep -E 'eth|CPU'
+
+# 输出示例（4 CPU 系统）：
+#            CPU0       CPU1       CPU2       CPU3
+#  34:  12345678          0          0          0   eth0-Rx-0
+#  35:          0   12345678          0          0   eth0-Tx-0
+#
+# ★ 问题：Rx 中断全部集中在 CPU0，Tx 中断全部集中在 CPU1
+# CPU0 和 CPU1 的 %soft 会很高，而 CPU2/CPU3 几乎空闲
+
+# 解决方案 1：IRQ 亲和性（irqbalance 或手动绑定）
+# 安装 irqbalance 自动均衡
+systemctl start irqbalance
+
+# 或手动绑定
+echo 0f > /proc/irq/34/smp_affinity  # 0f = CPU0-3 都可以处理
+
+# 解决方案 2：多队列网卡（硬件支持时）
+ethtool -l eth0    # 查看队列数
+ethtool -L eth0 combined 4   # 设置 4 个队列
+```
+
+### ★ RPS（Receive Packet Steering）— 软件多队列
+
+```
+RPS 是什么？
+─────────────
+  当网卡只有 1 个硬件队列时，所有收包中断集中在 1 个 CPU。
+  RPS 在软件层面将收包负载分散到多个 CPU。
+
+  工作原理：
+    网卡收包 → 单 CPU 硬中断
+                ↓
+           NAPI poll（单 CPU）
+                ↓
+           ★ RPS 按哈希将 skb 分发到其他 CPU 的 backlog
+                ↓
+           其他 CPU 处理 softirq（NET_RX）
+                ↓
+           协议栈处理（TCP/IP）→ 应用层
+
+配置方法：
+──────────
+  # 查看当前 RPS 配置
+  cat /sys/class/net/eth0/queues/rx-0/rps_cpus
+  # 输出 00 = RPS 未启用
+
+  # 启用 RPS：让所有 CPU 参与收包处理
+  echo ff > /sys/class/net/eth0/queues/rx-0/rps_cpus
+  # ff = 11111111（8 个 CPU 都参与）
+  # 4 CPU 系统用 0f，8 CPU 系统用 ff
+
+  # 配置 RFS（Receive Flow Steering）— 让包到达处理它的应用所在 CPU
+  echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
+  echo 4096 > /sys/class/net/eth0/queues/rx-0/rps_flow_cnt
+
+  ★ RPS 适合场景：
+    - 单队列网卡（虚拟化环境常见）
+    - 大流量场景（> 1Gbps）
+    - CPU 软中断不均衡
+
+  ★ RPS 不适合场景：
+    - 多队列网卡 + IRQ 已均衡
+    - 小包高 PPS 场景（RPS 本身的开销可能抵消收益）
+```
+
+### ★ TCP 性能调优参数
+
+```
+TCP 缓冲区调优
+──────────────
+  # 接收缓冲区（最小/默认/最大，单位字节）
+  cat /proc/sys/net/ipv4/tcp_rmem
+  # 默认：4096 131072 6291456（4KB / 128KB / 6MB）
+  
+  # 发送缓冲区
+  cat /proc/sys/net/ipv4/tcp_wmem
+  # 默认：4096 16384 6291456（4KB / 16KB / 6MB）
+  
+  # ★ 高带宽高延迟网络（BDP 大）需要调大缓冲区
+  # BDP = 带宽 × RTT
+  # 例：10Gbps × 10ms RTT = 12.5MB
+  # 此时 tcp_rmem 最大值应 > 12.5MB
+
+  # 调优示例（10Gbps 网络）
+  sysctl -w net.ipv4.tcp_rmem='4096 87380 16777216'
+  sysctl -w net.ipv4.tcp_wmem='4096 65536 16777216'
+
+TCP 拥塞算法
+────────────
+  # 查看当前拥塞算法
+  cat /proc/sys/net/ipv4/tcp_congestion_control
+  # 默认：cubic
+  
+  # 查看可用算法
+  cat /proc/sys/net/ipv4/tcp_available_congestion_control
+  
+  # ★ BBR vs CUBIC
+  # CUBIC：Linux 默认，适合一般场景
+  # BBR：Google 开发，适合高带宽高延迟 + 有丢包的网络
+  #       不依赖丢包信号，而是估计带宽和 RTT
+  
+  # 启用 BBR（需要内核 4.9+）
+  modprobe tcp_bbr
+  sysctl -w net.ipv4.tcp_congestion_control=bbr
+  
+  # 验证
+  ss -ti state established
+  # 输出中应显示 "bbr" 而非 "cubic"
+
+NAPI 和 busy polling
+─────────────────────
+  # NAPI（New API）：中断合并，减少中断次数
+  # 查看 NAPI 配置
+  cat /sys/class/net/eth0/napi_defer_hard_irqs  # 延迟硬中断次数
+  cat /sys/class/net/eth0/gro_flush_timeout      # GRO 刷新超时
+  
+  # ★ 调优高吞吐场景
+  echo 2 > /sys/class/net/eth0/napi_defer_hard_irqs
+  echo 20000 > /sys/class/net/eth0/gro_flush_timeout  # 20μs
+  
+  # 效果：减少中断次数，提高 GRO（Generic Receive Offload）效率
+  # 代价：增加少量延迟（20μs 级别）
+```
+
+### TIME_WAIT 过多 — 端口耗尽风险
+
+```
+问题：
+  TIME_WAIT 连接过多（> 数万），导致：
+  1. 本地端口耗尽（无法发起新连接）
+  2. 内存占用增加（每个 TIME_WAIT 占用约 0.5KB）
+
+检查：
+  ss -s                    # 查看 timewait 数量
+  ss -tn state time-wait | wc -l   # 精确计数
+  
+  # 按远端 IP 统计 TIME_WAIT 分布
+  ss -tn state time-wait | awk 'NR>1{print $5}' | cut -d: -f1 | sort | uniq -c | sort -rn
+
+优化方案：
+  ┌──────────────────────────────────────────────────────────┐
+  │ 1. 使用长连接（根本解决方案）                             │
+  │    HTTP Keep-Alive、数据库连接池、gRPC 长连接            │
+  │    → 减少连接创建和关闭的频率                             │
+  │                                                          │
+  │ 2. 调大 tcp_max_tw_buckets                               │
+  │    sysctl -w net.ipv4.tcp_max_tw_buckets=524288         │
+  │    → 允许更多 TIME_WAIT（治标）                          │
+  │                                                          │
+  │ 3. 启用 tcp_tw_reuse（安全复用）                         │
+  │    sysctl -w net.ipv4.tcp_tw_reuse=1                    │
+  │    → 允许新连接复用 TIME_WAIT 的端口                     │
+  │    → 需要同时启用 tcp_timestamps                         │
+  │                                                          │
+  │ 4. ★ 不要启用 tcp_tw_recycle（已移除）                   │
+  │    → Linux 4.12 已移除此参数                             │
+  │    → 在 NAT 环境下会导致连接异常                          │
+  │                                                          │
+  │ 5. 客户端端口范围扩展                                     │
+  │    sysctl -w net.ipv4.ip_local_port_range='1024 65535'  │
+  │    → 增加可用端口数（从约 2.8 万增到约 6.4 万）          │
+  └──────────────────────────────────────────────────────────┘
+```
+
+### 网络诊断命令速查表
+
+```
+问题                          │ 命令                                    │ 看什么
+──────────────────────────────┼─────────────────────────────────────────┼───────────────────
+CPU 高但吞吐正常              │ mpstat -P ALL 1                        │ %soft 列
+中断分布不均                  │ cat /proc/interrupts \| grep eth       │ 各 CPU 的中断计数
+TIME_WAIT 过多                │ ss -tn state time-wait \| wc -l        │ 数量 > 数万
+CLOSE_WAIT 堆积               │ ss -tn state close-wait                │ > 0 = 应用 Bug
+重传率高                      │ netstat -s \| grep retransmit          │ 重传率 > 1%
+SYN flood 攻击                │ ss -tn state syn-recv \| wc -l         │ > 100 需警惕
+TCP 缓冲区限制                │ cat /proc/sys/net/ipv4/tcp_rmem        │ 最小/默认/最大
+拥塞算法                      │ cat /proc/sys/net/ipv4/tcp_congestion  │ cubic vs bbr
+RPS 配置                      │ cat /sys/class/net/eth0/queues/rx-*/rps_cpus │ 是否启用
+socket 内存                   │ ss -s                                  │ Total 和 mem 行
+```
+
+---
+
+## 4. 核心概念索引
 
 ### TCP 连接的生命周期
 
@@ -365,7 +612,7 @@ ss 输出中的 Recv-Q / Send-Q：
 
 ---
 
-## 4. 动手实验清单
+## 5. 动手实验清单
 
 ### 实验 1: 基础连接查看
 

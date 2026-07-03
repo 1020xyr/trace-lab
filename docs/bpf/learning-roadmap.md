@@ -671,6 +671,32 @@ bpftrace -e '
 
 ---
 
+## 6.5 进阶：性能诊断 One-liners
+
+**阅读材料：** `reading/05_performance_diagnostics.md`
+
+**核心技能：**
+- 用 bpftrace 追踪自旋锁竞争（`_raw_spin_lock`）
+- 用 bpftrace 分析软中断处理时间（`__do_softirq`）
+- 用 bpftrace 追踪调度延迟（`sched_wakeup` + `sched_switch`）
+- 用 `hardware:` probe 关联 cache-miss 到调用栈
+
+```bash
+# 自旋锁热点
+bpftrace -e 'kprobe:_raw_spin_lock { @[kstack] = count(); }'
+
+# 软中断处理时间
+bpftrace -e 'kprobe:__do_softirq { @s=nsecs; }
+  kretprobe:__do_softirq /@s/ { @us=hist((nsecs-@s)/1000); @s=0; }'
+
+# 调度延迟
+bpftrace -e 'tracepoint:sched:sched_wakeup { @q[pid]=nsecs; }
+  tracepoint:sched:sched_switch /@q[args->next_pid]/ {
+    @us=hist((nsecs-@q[args->next_pid])/1000); }'
+```
+
+---
+
 ## 7. 关键源码文件索引
 
 ### 内核侧（/usr/include/linux/）

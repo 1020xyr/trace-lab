@@ -367,6 +367,54 @@ perf stat -e task-clock,context-switches,cpu-migrations,page-faults \
 
 ---
 
+## 4.5 进阶专题（性能诊断深入）
+
+完成基础实验后，按以下顺序学习进阶专题：
+
+### 专题 1：硬件计数器与性能诊断
+
+**阅读材料：** `reading/06_hw_counters_diagnosis.md`
+
+**核心技能：**
+- 用 `perf stat -d` 获取 IPC、cache-miss 率、branch-miss 率
+- 根据 IPC 和 cache-miss 率判断瓶颈类型
+- 诊断 CPU 高占用低吞吐的完整流程
+
+```bash
+# 关键命令
+perf stat -d -r 3 ./app                    # IPC + cache-miss + branch-miss
+perf stat -e stalled-cycles-frontend,stalled-cycles-backend,cycles ./app
+```
+
+### 专题 2：perf c2c — False Sharing 检测
+
+**阅读材料：** `reading/07_c2c_false_sharing.md`
+
+**核心技能：**
+- 理解 cache line 共享与 false sharing 的产生机制
+- 用 `perf c2c record` + `perf c2c report` 检测 HITM
+- 修复 false sharing（cache line 对齐）
+
+### 专题 3：perf lock — 锁竞争分析
+
+**阅读材料：** `reading/08_lock_contention.md`
+
+**核心技能：**
+- 用 `perf lock record` + `perf lock report` 分析锁争用
+- 定位自旋锁热点（`native_queued_spin_lock_slowpath`）
+- 锁竞争优化策略（减小临界区 / per-CPU / RCU）
+
+### 专题 4：perf mem + AMD 特定事件
+
+**阅读材料：** `reading/09_mem_and_amd.md`
+
+**核心技能：**
+- 用 `perf mem record` 分析内存访问延迟
+- AMD IBS（Instruction Based Sampling）的使用
+- AMD CCX/NUMA 拓扑对性能分析的影响
+
+---
+
 ## 5. 关键源码文件索引
 
 ### 内核侧

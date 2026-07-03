@@ -12,6 +12,7 @@
 | **3** | *（参考 learning-roadmap.md Step 4-5）* | strace `syscall.c` | — | 系统调用解码流水线、sysent 表、寄存器映射 |
 | **4** | [04_command_reference.md](./04_command_reference.md) | strace 全部源码 | ~450 | ★ 完整命令参考：参数与源码位置对照、过滤器分类、10+ 场景命令 |
 | **5** | [05_command_output_demo.md](./05_command_output_demo.md) | 实际执行 | ~550 | ★ 每个命令实际执行 + 真实输出 + 逐行注解 |
+| **6** | [06_performance_analysis.md](./06_performance_analysis.md) | 性能分析实战 | ~350 | ★ strace -c 统计、系统调用热点诊断、strace vs perf trace |
 
 ## 与其他文件的关系
 
@@ -22,6 +23,7 @@ reading/README.md       → 本文件（阅读入口）
 reading/01_*.md         → ptrace 核心机制
 reading/04_*.md         → 命令参考手册
 reading/05_*.md         → 实战输出解析
+reading/06_*.md         → ★ 性能分析应用（syscall 热点诊断）
 ```
 
 ## 阅读建议

@@ -250,7 +250,8 @@ LISTEN  0       511          0.0.0.0:80         0.0.0.0:*
 │       │       │            │                  └─ 接受来自任何地址的连接
 │       │       │            └─ ★ 监听所有 IPv4 地址的 80 端口
 │       │       └─ ★ backlog=511: listen() 队列长度
-│       │          (nginx 默认 worker_connections/2 + 1，最大受 somaxconn 限制)
+│       │          (nginx 默认 backlog=511，可通过 listen 80 backlog=N 修改，
+│       │           最大受 somaxconn 限制)
 │       └─ Recv-Q: 接收队列当前长度（0 = 无积压）
 └─ 状态: LISTEN
 

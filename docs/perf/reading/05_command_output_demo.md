@@ -990,6 +990,204 @@ perf report --stdio --no-children --sort comm,symbol | head -30
 
 ---
 
+## 场景 11：perf stat 诊断 CPU 高占用低吞吐（物理机）
+
+### 命令
+
+```bash
+# ★ 性能诊断第一步：获取核心硬件指标
+perf stat -e cache-misses,cache-references,L1-dcache-load-misses,\
+L1-dcache-loads,instructions,cycles,branches,branch-misses,\
+stalled-cycles-frontend,stalled-cycles-backend -r 3 ./app
+```
+
+### 预期输出（物理机，CPU 高占用低吞吐场景）
+
+```
+ Performance counter stats for './app' (3 runs):
+
+     1,234,567,890      cache-misses              #   18.50% of all cache refs
+     6,678,901,234      cache-references
+       456,789,012      L1-dcache-load-misses     #    4.57% of all L1 loads
+     9,999,000,000      L1-dcache-loads
+    15,000,000,000      instructions              #    0.68  insn per cycle
+    22,000,000,000      cycles
+     3,000,000,000      branches
+       150,000,000      branch-misses             #    5.00% of all branches
+     8,800,000,000      stalled-cycles-frontend   #   40.00% frontend cycles idle
+    13,200,000,000      stalled-cycles-backend    #   60.00% backend cycles idle
+```
+
+### 逐指标注解
+
+```
+IPC = instructions / cycles = 15G / 22G = 0.68
+  ★ IPC < 1.0 → CPU 效率低，每个周期只执行了 0.68 条指令
+  → 说明 CPU 流水线经常停顿
+
+cache-miss 率 = cache-misses / cache-references = 1.23G / 6.68G = 18.5%
+  ★ 18.5% > 15% → LLC miss 严重！
+  → 约 1/5 的 LLC 访问需要访问主存（~300 周期/次）
+
+L1-dcache miss 率 = 456M / 10G = 4.57%
+  → L1 miss 率在正常范围（< 5%），L1 命中率高
+  → 问题主要在 LLC 层
+
+branch-miss 率 = 150M / 3G = 5.0%
+  → 处于"一般"范围，有一定优化空间但不严重
+
+stalled-cycles-frontend = 40%
+  → 40% 的周期中前端在等待（指令获取/解码）
+  → 偏高，可能与分支预测失败相关
+
+stalled-cycles-backend = 60%
+  ★ 60% 的周期中后端在等待（数据访问）
+  → ★★ 这是主要瓶颈！后端停顿严重
+
+诊断结论：
+  IPC 低 (0.68) + cache-miss 率高 (18.5%) + backend 停顿高 (60%)
+  → ★ L3 cache miss 是性能瓶颈
+  → 下一步：perf c2c record → 检查 false sharing
+  → perf mem record → 查看内存访问延迟分布
+```
+
+### IPC 与瓶颈类型速查
+
+```
+IPC 值       │ 性能评级  │ 瓶颈类型
+────────────┼──────────┼──────────────────────
+> 2.0       │ ★ 优秀    │ 计算密集型（已充分利用流水线）
+1.5 ~ 2.0   │ 良好      │ 轻度内存等待
+1.0 ~ 1.5   │ 一般      │ 混合负载
+0.5 ~ 1.0   │ ★ 较差    │ 内存瓶颈 / 长延迟操作
+< 0.5       │ ★★ 很差   │ 严重停顿（cache/TLB/锁）
+```
+
+---
+
+## 场景 12：perf c2c 检测 cache line 争用
+
+### 命令
+
+```bash
+# 采集（多线程程序）
+perf c2c record ./multi_thread_app
+
+# 分析
+perf c2c report --stdio
+```
+
+### 预期输出（有 false sharing 的场景）
+
+```
+=====================================================
+         Shared Data Cache Line Table
+=====================================================
+#         ------- Cacheline ----------    Total     Tot  ----- LLC Load Hitm -----
+# Index      Address  Node  PA cnt  records   Pct       Hitm   Local   Remote
+# .....  ...............  ....  ......  .......  ......  .......  ......  .......
+    0      0x7f8a1c000     0      1     8542    32.1%     4521   3200     1321
+    1      0x7f8a1c040     0      1     3210    12.1%      890    700      190
+    2      0x7f8a1c080     0      2     1200     4.5%       50     45        5
+```
+
+### 逐列注解
+
+```
+Index 0:
+  Address = 0x7f8a1c000    ← ★ 这个 cache line 地址是热点
+  PA cnt = 1               ← 只有 1 个物理地址映射到这里
+  records = 8542           ← 被采样到 8542 次访问
+  Tot Pct = 32.1%          ← ★ 占总采样的 32.1%！
+  LLC Hitm = 4521          ← ★★ HITM（Hit Modified）4521 次
+                              → 其他 CPU 修改了这个 cache line
+  Local = 3200             ← 同 socket 内的 HITM
+  Remote = 1321            ← 跨 socket 的 HITM（更慢）
+
+★ HITM 是 false sharing 的直接证据：
+  4521 次 HITM 意味着这个 cache line 在 CPU 之间
+  反复迁移了 4521 次（Cache-to-Cache transfer）
+
+诊断结论：
+  cache line 0x7f8a1c000 有大量 HITM
+  → 多个线程写同一个 cache line 的不同变量（false sharing）
+  → 修复：将共享结构体对齐到 64 字节（cache line 大小）
+```
+
+---
+
+## 场景 13：perf lock 定位自旋锁热点
+
+### 命令
+
+```bash
+# 采集锁事件（全系统 10 秒）
+perf lock record -a sleep 10
+
+# 分析
+perf lock report --stdio
+```
+
+### 预期输出（有锁竞争的场景）
+
+```
+=== output for lock: &q->lock ===
+
+                acquired    contended   avg wait(ns)   total wait(ns)   max wait(ns)
+&q->lock            3200      890       8900          7921000           125000
+
+=== output for lock: &dev->lock ===
+
+                acquired    contended   avg wait(ns)   total wait(ns)   max wait(ns)
+&dev->lock          8500      230       1520           349600            45200
+```
+
+### 逐列注解
+
+```
+&q->lock（争用最严重的锁）：
+  acquired = 3200        ← 获取锁的总次数
+  contended = 890        ← ★★ 争用次数 890 次（27.8% 争用率！）
+  avg wait = 8900ns      ← ★ 平均等待 8.9μs
+  total wait = 7.9ms     ← ★ 总浪费 7.9ms CPU 时间
+  max wait = 125000ns    ← 最大单次等待 125μs
+
+&dev->lock（轻度竞争）：
+  acquired = 8500        ← 获取更频繁
+  contended = 230        ← 争用率低（2.7%）
+  avg wait = 1520ns      ← 平均等待 1.5μs（轻微竞争）
+
+诊断结论：
+  &q->lock 争用率 27.8%，平均等待 8.9μs
+  → ★ 严重的锁竞争，导致 CPU 高占用低吞吐
+  → 下一步：perf lock report -s caller → 查看哪个调用路径
+  → 考虑减小临界区 / 使用 per-CPU 变量 / 换锁类型
+```
+
+### 按调用栈分析
+
+```bash
+perf lock report -s caller --stdio
+```
+
+```
+=== acquired at:
+
+  native_queued_spin_lock_slowpath
+  _raw_spin_lock_irqsave
+  process_packet           ← ★ 这个函数持锁时间过长
+  handle_request
+  worker_thread
+
+    acquired: 3200   contended: 890   avg wait: 8900ns
+
+★ 定位到 process_packet() 是锁竞争热点
+  → 检查该函数的临界区大小
+  → 考虑将非共享操作移出锁保护范围
+```
+
+---
+
 ## 常用命令速查表
 
 ```

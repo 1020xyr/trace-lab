@@ -1,16 +1,17 @@
 # BPF/eBPF 源码阅读指南
 
 > 本目录包含 BPF 子系统和三大工具（bcc/bpftrace/libbpf）的源码阅读材料，每个文件都带有详细中文注释。
-> 按 Step 1 → 4 的顺序阅读。
+> 按 Step 1 → 5 的顺序阅读。
 
 ## 阅读路线
 
 | Step | 文件 | 来源 | 行数 | 关注点 |
 |------|------|------|------|--------|
-| **1** | [01_bpf_architecture.md](./01_bpf_architecture.md) | 内核 `bpf.h` + libbpf | 350+ | BPF 程序类型、verifier 原理、Map 类型、helper functions |
-| **2** | [02_bpftrace_basics.md](./02_bpftrace_basics.md) | bpftrace 源码 | 350+ | probe 类型、内置变量、map 操作、聚合函数、编译流程 |
-| **3** | [03_command_reference.md](./03_command_reference.md) | bpftrace + bpftool | 400+ | bpftrace 语法速查、常用 one-liners 30+、bpftool 命令 |
-| **4** | [04_command_output_demo.md](./04_command_output_demo.md) | 实际执行输出 | 400+ | bpftrace one-liners 真实输出 + 逐行注解 + 与 blktrace 对比 |
+| **1** | [01_bpf_architecture.md](./01_bpf_architecture.md) | 内核 `bpf.h` + libbpf | 740+ | BPF 程序类型、verifier 原理、Map 类型、helper functions、JIT |
+| **2** | [02_bpftrace_basics.md](./02_bpftrace_basics.md) | bpftrace 源码 | 730+ | probe 类型、内置变量、map 操作、聚合函数、编译流程 |
+| **3** | [03_command_reference.md](./03_command_reference.md) | bpftrace + bpftool | 620+ | bpftrace 语法速查、常用 one-liners 30+、bpftool 命令 |
+| **4** | [04_command_output_demo.md](./04_command_output_demo.md) | 实际执行输出 | 1040+ | bpftrace one-liners 真实输出 + 逐行注解 + 与 blktrace 对比 |
+| **5** | [05_performance_diagnostics.md](./05_performance_diagnostics.md) | ★ 综合文档 | 350+ | 性能诊断 one-liners：自旋锁追踪、软中断分析、调度延迟、cache miss |
 
 ## 阅读建议
 
@@ -18,7 +19,8 @@
 2. **Step 2 学 bpftrace**：从最简单的 one-liner 开始，理解 probe 类型和 DSL 语法
 3. **Step 3 当速查表**：语法参考 + 30+ 实用 one-liners + bpftool 命令
 4. **Step 4 看真实输出**：每个命令实际执行，对照输出理解每个字段的含义
-5. **结合 blktrace 学习**：Step 4 中有 bpftrace 与 blktrace 追踪同一事件的对比
+5. **Step 5 性能诊断**：★ 针对 CPU 高占用低吞吐、软中断高、锁竞争的实战诊断脚本
+6. **结合 blktrace 学习**：Step 4 中有 bpftrace 与 blktrace 追踪同一事件的对比
 
 ## 文件说明
 
