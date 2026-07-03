@@ -13,8 +13,9 @@
   - [Step 3: 数据源 — /proc/net/tcp vs netlink socket](#step-3-数据源--procnetsctp-vs-netlink-socket)
   - [Step 4: 命令参考 — 完整参数与场景](#step-4-命令参考--完整参数与场景)
   - [Step 5: 输出实战 — 真实输出逐行解读](#step-5-输出实战--真实输出逐行解读)
-- [3. 核心概念索引](#3-核心概念索引)
-- [4. 动手实验清单](#4-动手实验清单)
+- [3. ★ 网络性能诊断专题](#3--网络性能诊断专题)
+- [4. 核心概念索引](#4-核心概念索引)
+- [5. 动手实验清单](#5-动手实验清单)
 
 ---
 
@@ -154,7 +155,7 @@ TCP 状态机（RFC 793）：
 
 **目标：** 理解为什么 ss 比 netstat 更快、信息更丰富
 
-**阅读材料：** `reading/02_netstat_vs_ss.md`
+**阅读材料：** `reading/02_command_reference.md`
 
 **核心差异：**
 
@@ -177,7 +178,7 @@ socket 统计  基本                        ✅ 完整的协议统计
 
 **目标：** 理解内核如何暴露 socket 信息
 
-**阅读材料：** `reading/02_netstat_vs_ss.md`（数据源章节）
+**阅读材料：** `reading/02_command_reference.md`（数据源章节）
 
 **/proc/net/tcp 格式：**
 
@@ -256,7 +257,7 @@ ss -tna | awk 'NR>1{print $1}' | sort | uniq -c | sort -rn
 
 **目标：** 理解每一列的含义，学会诊断实际问题
 
-**阅读材料：** `reading/04_command_output_demo.md`
+**阅读材料：** `reading/03_command_output_demo.md`
 
 **诊断场景速查：**
 
