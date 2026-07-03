@@ -309,4 +309,229 @@ perf stat 显示 IPC < 1
 
 ---
 
+## Q4: perf record 报 "perf_event_paranoid" 错误怎么解决？
+
+**日期：** 2026-07-04
+**场景：** 普通用户执行 `perf record` 时报 `Error: Permission denied. Hint: Check /proc/sys/kernel/perf_event_paranoid setting`，不清楚原因和解决方案
+**相关文件：** `reading/05_perf_record_flow.md`
+
+### 回答
+
+`perf_event_paranoid` 是内核的安全旋钮，控制非特权用户能使用哪些 perf 功能。默认值是 **2**（限制最严格之一），不同级别限制不同功能。
+
+#### 1. 源码验证：默认值和各级别含义
+
+内核在 `kernel/events/core.c:405-411` 定义了 paranoid 注释和默认值：
+
+```c
+// kernel/events/core.c:405-411
+/*
+ * perf event paranoia level:
+ *  -1 - not paranoid at all
+ *   0 - disallow raw tracepoint access for unpriv
+ *   1 - disallow cpu events for unpriv
+ *   2 - disallow kernel profiling for unpriv
+ */
+int sysctl_perf_event_paranoid __read_mostly = 2;  // ★ 默认值是 2
+```
+
+内核通过三个 inline 函数实现分级权限检查（`include/linux/perf_event.h:1315-1337`）：
+
+```c
+// include/linux/perf_event.h:1315-1337
+static inline int perf_allow_kernel(struct perf_event_attr *attr)
+{
+    if (sysctl_perf_event_paranoid > 1 && !perfmon_capable())
+        return -EACCES;       // paranoid ≥ 2：禁止内核态采样
+    return security_perf_event_open(attr, PERF_SECURITY_KERNEL);
+}
+
+static inline int perf_allow_cpu(struct perf_event_attr *attr)
+{
+    if (sysctl_perf_event_paranoid > 0 && !perfmon_capable())
+        return -EACCES;       // paranoid ≥ 1：禁止 CPU 级事件
+    return security_perf_event_open(attr, PERF_SECURITY_CPU);
+}
+
+static inline int perf_allow_tracepoint(struct perf_event_attr *attr)
+{
+    if (sysctl_perf_event_paranoid > -1 && !perfmon_capable())
+        return -EPERM;        // paranoid ≥ 0：禁止 tracepoint
+    return security_perf_event_open(attr, PERF_SECURITY_TRACEPOINT);
+}
+```
+
+#### 2. 权限检查的核心：perfmon_capable()
+
+`perfmon_capable()` 是权限判断的关键函数（`include/linux/capability.h:254-257`）：
+
+```c
+// include/linux/capability.h:254-257
+static inline bool perfmon_capable(void)
+{
+    return capable(CAP_PERFMON) || capable(CAP_SYS_ADMIN);
+    // ★ 拥有 CAP_PERFMON 或 CAP_SYS_ADMIN 其中之一即可绕过 paranoid 限制
+}
+```
+
+> ★ **Linux 5.8+ 引入了 `CAP_PERFMON`（capability 38）**，这是专门为性能监控设计的权限，比 `CAP_SYS_ADMIN` 更精细。`root` 用户天然拥有 `CAP_SYS_ADMIN`，所以 `sudo perf record` 总是成功。
+
+#### 3. perf_event_open 系统调用中的权限检查流程
+
+`perf_event_open` 系统调用（`kernel/events/core.c:11618`）的权限检查顺序：
+
+```
+SYSCALL_DEFINE5(perf_event_open, ...)          // core.c:11618
+│
+├── 1. security_perf_event_open(attr, PERF_SECURITY_OPEN)   // core.c:11641
+│   └── SELinux/AppArmor 等 LSM 检查（是否允许打开 perf 事件）
+│
+├── 2. perf_copy_attr() → 拷贝用户空间参数
+│
+├── 3. if (!attr.exclude_kernel)               // core.c:11649
+│   └── perf_allow_kernel(&attr)               // ★ paranoid > 1 且无权限 → -EACCES
+│       └── 这就是为什么默认值 2 禁止非 root 做内核态采样
+│
+├── 4. if (attr.namespaces)
+│   └── perfmon_capable() 检查                  // core.c:11656
+│
+└── 后续：task 级 ptrace 权限检查               // core.c:11737
+    └── 监控其他进程也需要权限
+```
+
+#### 4. 各级别权限对照表
+
+| paranoid 值 | 用户态采样 | 内核态采样 | CPU 级事件 | tracepoint | 系统范围 | 典型用户 |
+|-------------|-----------|-----------|-----------|------------|---------|---------|
+| **-1** | ✅ | ✅ | ✅ | ✅ | ✅ | 开发/测试环境 |
+| **0** | ✅ | ✅ | ✅ | ❌ | 部分 | 允许大部分功能 |
+| **1** | ✅ | ✅ | ❌ | ❌ | ❌ | 仅监控自己的进程 |
+| **2**（默认） | ✅ | ❌ | ❌ | ❌ | ❌ | ★ 多数发行版默认值 |
+| **3**（Ubuntu/Debian） | ❌ | ❌ | ❌ | ❌ | ❌ | 最严格，完全禁用 |
+
+> ★ **注意：** paranoid=3 不是上游内核标准，而是 Ubuntu/Debian 等发行版的补丁。上游内核注释只到 2。
+
+#### 5. perf 用户态的 fallback 机制
+
+perf 工具本身在遇到权限错误时有自动降级逻辑（`tools/perf/util/evsel.c:2522-2549`）：
+
+```c
+// tools/perf/util/evsel.c:2522-2549
+} else if (err == EACCES && !evsel->core.attr.exclude_kernel &&
+           (paranoid = perf_event_paranoid()) > 1) {
+    // ★ 当 paranoid > 1 且遇到 EACCES 时，自动添加 exclude_kernel
+    //   即从内核+用户态采样 降级为 仅用户态采样
+
+    scnprintf(msg, msgsize, "kernel.perf_event_paranoid=%d, trying "
+              "to fall back to excluding kernel and hypervisor "
+              " samples", paranoid);
+    evsel->core.attr.exclude_kernel = 1;
+    evsel->core.attr.exclude_hv     = 1;
+    return true;
+}
+```
+
+perf 还会给出友好的错误提示（`tools/perf/util/evlist.c:1478-1497`）：
+
+```c
+// tools/perf/util/evlist.c:1478-1497
+case EACCES:
+case EPERM:
+    "Error:\t%s.\n"
+    "Hint:\tCheck /proc/sys/kernel/perf_event_paranoid setting."
+    // 如果 value >= 2：提示 "For your workloads it needs to be <= 1"
+    // 系统范围追踪："For system wide tracing it needs to be set to -1"
+    // 修复命令：'sudo sh -c "echo -1 > /proc/sys/kernel/perf_event_paranoid"'
+```
+
+用户态也通过 `perf_event_paranoid_check()` 做预检查（`tools/perf/util/util.c:290-294`）：
+
+```c
+// tools/perf/util/util.c:290-294
+bool perf_event_paranoid_check(int max_level)
+{
+    return perf_cap__capable(CAP_SYS_ADMIN) ||
+           perf_cap__capable(CAP_PERFMON) ||
+           perf_event_paranoid() <= max_level;
+    // ★ 三重检查：root 权限 || CAP_PERFMON 权限 || paranoid 值足够低
+}
+```
+
+#### 6. 解决方案
+
+**方案 A：临时降低 paranoid 值（推荐用于开发/测试）**
+
+```bash
+# 查看当前值
+cat /proc/sys/kernel/perf_event_paranoid
+
+# 允许内核态采样（paranoid ≤ 1）
+sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid'
+
+# 允许系统范围采样（paranoid = -1）
+sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
+
+# 仅监控自己的进程（不需要修改，paranoid=2 也允许）
+perf record ./my_app
+```
+
+**方案 B：永久修改（写入 sysctl 配置）**
+
+```bash
+# 写入 sysctl 配置
+echo 'kernel.perf_event_paranoid=1' | sudo tee /etc/sysctl.d/99-perf.conf
+sudo sysctl --system
+```
+
+**方案 C：使用 CAP_PERFMON 权限（Linux 5.8+，最安全）**
+
+```bash
+# 给 perf 二进制文件添加 CAP_PERFMON capability
+sudo setcap cap_perfmon,cap_sys_admin+ep $(which perf)
+
+# 或者只给 CAP_SYS_ADMIN（旧内核）
+sudo setcap cap_sys_admin+ep $(which perf)
+
+# 验证
+getcap $(which perf)
+# 输出：/usr/bin/perf cap_sys_admin,cap_perfmon=ep
+```
+
+**方案 D：sudo 运行（最简单但不推荐生产）**
+
+```bash
+sudo perf record -g ./my_app
+```
+
+#### 7. 不同 paranoid 值下的 perf 命令可用性
+
+```bash
+# paranoid=2（默认）：
+perf record ./app              # ✅ 用户态采样（自动 fallback）
+perf record -a ./app           # ❌ 系统范围采样被禁止
+perf record -e cycles:k ./app  # ❌ 内核态采样被禁止
+
+# paranoid=1：
+perf record ./app              # ✅
+perf record -e cycles:k ./app  # ✅
+perf record -a ./app           # ❌ 系统范围仍需 root
+
+# paranoid=-1：
+perf record -a -g -- sleep 10  # ✅ 全部功能开放
+```
+
+#### 8. 安全建议
+
+| 场景 | 推荐 paranoid 值 | 说明 |
+|------|-----------------|------|
+| 生产服务器 | 2（默认） | 仅允许用户态自监控 |
+| 开发测试机 | 1 | 允许内核态采样 |
+| CI/性能测试 | -1 | 完全开放 |
+| 容器环境 | 2 + `--cap-add=SYS_ADMIN` | 容器内需要额外 capability |
+| 多用户服务器 | 2 + CAP_PERFMON | 精细授权特定用户 |
+
+**★ 一句话总结：** `perf_event_paranoid` 默认值 2 禁止非 root 做内核态/系统范围采样，开发环境 `echo -1 > /proc/sys/kernel/perf_event_paranoid` 即可解决；生产环境推荐用 `CAP_PERFMON` 精细授权。
+
+---
+
 *新的问题将追加到此文件。每个问题记录日期、场景、相关文件。*

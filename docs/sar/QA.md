@@ -8,6 +8,7 @@
 
 - [Q1: sar 发现 %system 很高但吞吐低怎么排查？](#q1-sar-发现-system-很高但吞吐低怎么排查)
 - [Q2: 如何用 sar 判断网络软中断 CPU 不均衡？](#q2-如何用-sar-判断网络软中断-cpu-不均衡)
+- [Q3: sar 数据和 vmstat/top 数据不一致，以哪个为准？](#q3-sar-数据和-vmstaptop-数据不一致以哪个为准)
 
 ---
 
