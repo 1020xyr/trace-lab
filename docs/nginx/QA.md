@@ -8,6 +8,7 @@
 
 - [Q1: AMD CCD 拓扑下 nginx worker 如何绑定 CPU？](#q1-amd-ccd-拓扑下-nginx-worker-如何绑定-cpu)
 - [Q2: nginx worker CPU 高但 QPS 低怎么排查？](#q2-nginx-worker-cpu-高但-qps-低怎么排查)
+- [Q3: nginx 的 worker_processes 设多少合适？和 CPU 核数的关系？](#q3-nginx-的-worker_processes-设多少合适和-cpu-核数的关系)
 
 ---
 

@@ -167,4 +167,134 @@ sar -I XALL 1 5
 
 ---
 
+## Q3: sar 数据和 vmstat/top 数据不一致，以哪个为准？
+
+**日期：** 2026-07-04
+**场景：** 同一时间段内，sar -u 显示 %user=30%，但 top 显示某个进程 CPU 占用 80%，产生疑惑
+**相关文件：** `reading/01_sar_architecture.md`
+
+### 回答
+
+**三个工具的底层数据源相同（都读 /proc），但因为采样间隔和计算方式不同，导致数值看起来不一致。** 不存在"谁更准"的问题，而是它们在不同时间粒度上都是正确的。
+
+#### ★ 数据源对比表
+
+| 指标 | sar 数据源 | vmstat 数据源 | top 数据源 | 是否相同 |
+|------|-----------|-------------|-----------|---------|
+| CPU 时间 | `/proc/stat` | `/proc/stat` | `/proc/stat` | ★ 完全相同 |
+| 内存 | `/proc/meminfo` | `/proc/meminfo` | `/proc/meminfo` | ★ 完全相同 |
+| 换页 | `/proc/vmstat` | `/proc/vmstat` | — | ★ 完全相同 |
+| 磁盘 | `/proc/diskstats` | — | — | — |
+| 上下文切换 | `/proc/stat` | `/proc/stat` | — | ★ 完全相同 |
+
+**源码依据（sar 的数据采集函数）：**
+
+```
+sar 的 sadc 每次采集时调用以下函数：
+  read_stat_cpu()    → /proc/stat         → CPU 时间    ← vmstat/top 也读这里
+  read_stat_memory() → /proc/meminfo       → 内存使用
+  read_stat_disk()   → /proc/diskstats     → 磁盘 I/O
+  read_stat_paging() → /proc/vmstat        → 页面换入换出 ← vmstat 也读这里
+  read_stat_queue()  → /proc/loadavg       → 负载/队列
+
+（来源：reading/01_sar_architecture.md 第 284-291 行）
+```
+
+#### ★ 不一致的三个根因
+
+**根因 1：采样间隔不同（最常见）**
+
+```
+时间线：
+  0s ──────── 3s ──────── 60s ──────── 600s
+  │           │           │             │
+  top(3s)     top(3s)     top(3s)       sar(600s)
+  CPU=100%    CPU=0%      CPU=0%        CPU=0.5%
+
+top 看到：0-3 秒内 CPU 100%（短时尖峰）
+sar 看到：0-600 秒内平均 CPU 0.5%（★ 尖峰被平均掉了）
+
+★ 结论：sar 的默认 10 分钟粒度会掩盖短时尖峰
+```
+
+**根因 2：计算方式不同**
+
+```
+top 的 %CPU：
+  %CPU = (进程 CPU 时间增量 / 采样间隔) × 100%
+  ★ 多核系统上可以 > 100%（例如 4 核上最高 400%）
+  ★ top 默认显示单核百分比
+
+sar 的 %user：
+  %user = (user_jiffies_diff / total_jiffies_diff) × 100%
+  ★ 是所有 CPU 的平均值
+  ★ 永远不会 > 100%
+
+示例（8 核机器）：
+  1 个进程占满 1 个核：
+    top:   %CPU = 100%（单核视角）
+    sar:   %user = 12.5%（8 核平均 = 100/8）
+    sar -P ALL: CPU 3 = 100%（★ 用 -P ALL 看单核就一致了）
+```
+
+**根因 3：vmstat 的特殊输出格式**
+
+```
+vmstat 1:
+  procs ──── memory ──── swap ── io ── system ── cpu ──
+   r  b   swpd  free  buff  cache  si so  bi bo  in cs  us sy id wa st
+   2  0      0 12345  6789 123456   0  0   0  0 100 200 30 10 60  0  0
+
+  us = user%, sy = system%, id = idle%
+  ★ vmstat 和 sar -u 都读 /proc/stat，数值应该一致
+  ★ 但如果 vmstat 采样间隔 = 1s，sar 采样间隔 = 600s，数值会不同
+```
+
+#### ★ 对照表：什么时候用谁
+
+```
+需求                             推荐工具              理由
+─────────────────────────────    ──────────────────    ──────────────────
+实时看某个进程的 CPU              top / pidstat         ★ top 按进程拆分
+实时看全局 CPU 分布               sar -u 1 5            1 秒粒度，准确
+查看历史 CPU 趋势（昨天）          sar -u -f /var/log/sa/saXX  ★ sar 独有
+快速看一眼全貌                    vmstat 1              单行输出，直观
+CPU + 内存 + IO + 网络综合        sar -A 1 5            一次看所有维度
+确认 sar 和 top 是否一致          sar -u -P ALL 1 3     ★ 必须用 1 秒粒度 + 单核
+```
+
+#### 验证方法：让 sar 和 top 输出一致
+
+```bash
+# 方法：两者都用 1 秒粒度，同时运行
+# 终端 1：
+sar -u -P ALL 1 5
+
+# 终端 2：
+top -bn1 -d1 | head -5
+
+# 对比：
+# sar 的 %user（所有 CPU 平均）≈ top 的 %us（所有 CPU 平均）
+# sar -P ALL 的单核 %user ≈ top 按 1 切换后单核的 %us
+```
+
+#### ★ 关键结论
+
+```
+                    数据源         采样粒度          视角
+  sar (默认)        /proc/stat     10 分钟           全局平均
+  sar -u 1          /proc/stat     1 秒              全局平均
+  sar -P ALL 1      /proc/stat     1 秒              单核
+  vmstat 1          /proc/stat     1 秒              全局平均
+  top               /proc/stat     3 秒              按进程 + 全局
+
+★ 数据源完全相同，差异来自采样间隔和计算方式
+★ 要对齐：统一用 1 秒粒度 + 相同视角（全局 or 单核）
+★ sar 的独有优势：历史数据查询（-f /var/log/sa/saXX）
+```
+
+**一句话总结：** sar、vmstat、top 都读 `/proc/stat`，数据源完全相同。数值不一致是因为采样间隔不同（sar 默认 10 分钟 vs top 默认 3 秒）和计算方式不同（全局平均 vs 单核百分比）。统一用 1 秒粒度即可对齐。
+
+---
+
 *新的问题将追加到此文件。每个问题记录日期、场景、相关文件。*
