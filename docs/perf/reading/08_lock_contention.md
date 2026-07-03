@@ -9,9 +9,14 @@
 >
 > 相关源码：
 >   - src/linux-5.10/tools/perf/builtin-lock.c — perf lock 实现
->   - src/linux-5.10/kernel/locking/           — 内核锁实现
+>   - src/linux-5.10/kernel/locking/qspinlock.c — queued spinlock 慢路径
+>   - src/linux-5.10/include/asm-generic/qspinlock.h — queued spinlock 快速路径
+>   - src/linux-5.10/include/asm-generic/qspinlock_types.h — qspinlock 数据结构
+>   - src/linux-5.10/kernel/locking/mcs_spinlock.h — MCS 队列节点
+>   - src/linux-5.10/include/asm-generic/qrwlock.h — 队列读写锁
+>   - src/linux-5.10/kernel/locking/spinlock.c — 自旋锁入口
 >
-> 预计阅读时间：15 分钟
+> 预计阅读时间：25 分钟
 > ======================================================================
 
 ---

@@ -52,7 +52,7 @@
 
 ---
 
-## 2. iostat 与 blktrace 的关系
+## 2. ★ iostat 与 blktrace 的关系 — 宏观发现 → 微观定位
 
 ```
 iostat                              blktrace
@@ -65,6 +65,8 @@ iostat                              blktrace
 看到 %util=100%                      看到每个 I/O 的 Q→D→C
 看到 await=5ms                       看到 D2C=147μs
 ```
+
+**★ 核心原则：** iostat 用于"发现问题"，blktrace 用于"定位问题"。两者配合是 I/O 诊断的黄金组合。
 
 **诊断流程：**
 ```

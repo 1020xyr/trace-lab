@@ -587,13 +587,13 @@ bpftool prog show
 
 | 传统工具 | bpftrace 等价命令 |
 |---------|------------------|
-| `strace -p PID` | `bpftrace -e 'tracepoint:raw_syscalls:sys_enter /pid==PID/ { printf("%d\n", args->id); }'` |
-| `opensnoop` | `bpftrace -e 'kprobe:do_sys_openat2 { printf("%s %s\n", comm, str(arg1)); }'` |
-| `execsnoop` | `bpftrace -e 'tracepoint:syscalls:sys_enter_execve { printf("%s\n", str(args->filename)); }'` |
-| `tcpconnect` | `bpftrace -e 'kprobe:tcp_v4_connect { printf("%s\n", comm); }'` |
-| `biolatency` | `bpftrace -e 'tracepoint:block:block_rq_issue{@s[args->sector]=nsecs;} tracepoint:block:block_rq_complete/@s[args->sector]/{@=hist((nsecs-@s[args->sector])/1000);delete(@s[args->sector]);}'` |
-| `blktrace + btt` | `bpftrace biolatency.bt`（见上面的脚本模板） |
-| `perf top` | `bpftrace -e 'profile:hz:99 { @[kstack] = count(); }'` |
+| `strace -p PID` | ★ `bpftrace -e 'tracepoint:raw_syscalls:sys_enter /pid==PID/ { printf("%d\n", args->id); }'` |
+| `opensnoop` | ★ `bpftrace -e 'kprobe:do_sys_openat2 { printf("%s %s\n", comm, str(arg1)); }'` |
+| `execsnoop` | ★ `bpftrace -e 'tracepoint:syscalls:sys_enter_execve { printf("%s\n", str(args->filename)); }'` |
+| `tcpconnect` | ★ `bpftrace -e 'kprobe:tcp_v4_connect { printf("%s\n", comm); }'` |
+| `biolatency` | ★ `bpftrace -e 'tracepoint:block:block_rq_issue{@s[args->sector]=nsecs;} tracepoint:block:block_rq_complete/@s[args->sector]/{@=hist((nsecs-@s[args->sector])/1000);delete(@s[args->sector]);}'` |
+| `blktrace + btt` | ★ `bpftrace biolatency.bt`（见上面的脚本模板） |
+| `perf top` | ★ `bpftrace -e 'profile:hz:99 { @[kstack] = count(); }'` |
 
 ---
 

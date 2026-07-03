@@ -527,6 +527,8 @@ void __init check_bugs(void)
 
 ---
 
+## 4. 乱序执行与 ROB
+
 ### 4.1 ★ 为什么需要乱序执行
 
 ```

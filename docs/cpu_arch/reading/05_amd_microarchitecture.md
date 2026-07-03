@@ -543,7 +543,90 @@ void cacheinfo_amd_init_llc_id(struct cpuinfo_x86 *c,
  */
 ```
 
-### 3.3 32MB L3 的实际含义
+### 3.3 ★ 内核如何枚举 AMD 缓存层级（CPUID 0x8000001D）
+
+AMD 支持 TOPOEXT 的处理器使用 CPUID leaf 0x8000001D 枚举各级缓存：
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/cacheinfo.c:592-626 */
+static int
+cpuid4_cache_lookup_regs(int index,
+		struct _cpuid4_info_regs *this_leaf)
+{
+	union _cpuid4_leaf_eax eax;
+	union _cpuid4_leaf_ebx ebx;
+	union _cpuid4_leaf_ecx ecx;
+	unsigned edx;
+
+	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
+		/* ★ AMD: 有 TOPOEXT 时用 CPUID 0x8000001D */
+		if (boot_cpu_has(X86_FEATURE_TOPOEXT))
+			cpuid_count(0x8000001d, index,
+				    &eax.full, &ebx.full,
+				    &ecx.full, &edx);
+		else
+			amd_cpuid4(index, &eax, &ebx, &ecx);
+		amd_init_l3_cache(this_leaf, index);
+	} else {
+		/* Intel: 使用 CPUID leaf 4 */
+		cpuid_count(4, index,
+			    &eax.full, &ebx.full,
+			    &ecx.full, &edx);
+	}
+
+	/* 缓存大小计算公式（Intel/AMD 通用） */
+	this_leaf->size =
+		  (ecx.split.number_of_sets          + 1) *
+		  (ebx.split.coherency_line_size     + 1) *
+		  (ebx.split.physical_line_partition + 1) *
+		  (ebx.split.ways_of_associativity   + 1);
+	return 0;
+}
+```
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/cacheinfo.c:628-647 */
+/* 枚举缓存层级数量：逐级查询直到返回 NULL 类型 */
+static int find_num_cache_leaves(struct cpuinfo_x86 *c)
+{
+	unsigned int eax, ebx, ecx, edx, op;
+	union _cpuid4_leaf_eax cache_eax;
+	int i = -1;
+
+	/* AMD 用 CPUID 0x8000001D，Intel 用 CPUID 4 */
+	if (c->x86_vendor == X86_VENDOR_AMD ||
+	    c->x86_vendor == X86_VENDOR_HYGON)
+		op = 0x8000001d;
+	else
+		op = 4;
+
+	do {
+		++i;
+		cpuid_count(op, i, &eax, &ebx, &ecx, &edx);
+		cache_eax.full = eax;
+	} while (cache_eax.split.type != CTYPE_NULL);
+	/* ★ 典型返回 4：L1d(0) L1i(1) L2(2) L3(3) */
+	return i;
+}
+```
+
+```
+  ★ CPUID 0x8000001D sub-leaf 结构（与 Intel CPUID 4 对应）:
+
+  sub-leaf 0: L1 Data Cache      (32 KB, 8-way, 64B line)
+  sub-leaf 1: L1 Instruction Cache (32 KB, 8-way, 64B line)
+  sub-leaf 2: L2 Unified Cache    (512 KB/Zen3, 1 MB/Zen4)
+  sub-leaf 3: L3 Unified Cache    (32 MB per CCD)
+
+  EAX[4:0]   = Cache Type (1=Data, 2=Inst, 3=Unified)
+  EAX[7:5]   = Cache Level (1, 2, or 3)
+  EAX[25:14] = NumSharingCache - 1 ★ 共享此缓存的线程数 - 1
+  EBX[11:0]  = Coherency Line Size - 1
+  EBX[21:12] = Ways of Associativity - 1
+  ECX[31:0]  = Number of Sets - 1
+```
+
+### 3.4 32MB L3 的实际含义
 
 | 场景 | 32MB L3 是否足够 | 说明 |
 |------|-----------------|------|
@@ -565,7 +648,7 @@ void cacheinfo_amd_init_llc_id(struct cpuinfo_x86 *c,
     → 大部分数据驻留 L3 → 低 miss 率
 ```
 
-### 3.4 AMD L3 Cache Partitioning（L3 Way Partitioning）
+### 3.5 AMD L3 Cache Partitioning（L3 Way Partitioning）
 
 AMD EPYC 支持通过 **Platform QoS (PQoS)** 对 L3 进行分区：
 
@@ -598,6 +681,65 @@ AMD EPYC 支持通过 **Platform QoS (PQoS)** 对 L3 进行分区：
 ```
 
 **★ 使用场景：** 防止低优先级线程（如批处理任务）污染高优先级线程（如在线服务）的 L3 缓存。
+
+### 3.6 ★ L3 子缓存（Subcache）结构的内核实现
+
+AMD 的 L3 Cache 物理上分为 4 个子缓存（subcache），内核通过 PCI
+配置寄存器检测各子缓存的存在和大小：
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/cacheinfo.c:194-203 */
+/* L3 缓存描述符的位域定义（CPUID 0x80000006 EDX） */
+union l3_cache {
+	struct {
+		unsigned line_size:8;      /* 缓存行大小 */
+		unsigned lines_per_tag:4;   /* 每 tag 行数 */
+		unsigned assoc:4;           /* 关联度编码 */
+		unsigned res:2;             /* 保留 */
+		unsigned size_encoded:14;   /* ★ 容量编码 */
+	};
+	unsigned val;
+};
+/*
+ * ★ L3 容量计算公式:
+ *   size_in_kb = size_encoded * 512
+ *   例如 Zen 3: size_encoded = 64 → 64 * 512 = 32768 KB = 32 MB
+ */
+```
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/cacheinfo.c:306-327 */
+/* L3 子缓存索引计算 —— 用于 L3 Way Partitioning */
+static void amd_calc_l3_indices(struct amd_northbridge *nb)
+{
+	struct amd_l3_cache *l3 = &nb->l3_cache;
+	unsigned int sc0, sc1, sc2, sc3;
+	u32 val = 0;
+
+	/* ★ 从 Northbridge PCI 配置空间 0x1C4 读取子缓存信息 */
+	pci_read_config_dword(nb->misc, 0x1C4, &val);
+
+	/* 计算各子缓存是否存在（位为 0 = 存在） */
+	l3->subcaches[0] = sc0 = !(val & BIT(0));
+	l3->subcaches[1] = sc1 = !(val & BIT(4));
+	l3->subcaches[2] = sc2 = !(val & BIT(8))  + !(val & BIT(9));
+	l3->subcaches[3] = sc3 = !(val & BIT(12)) + !(val & BIT(13));
+
+	/* ★ 取最大子缓存的 indices 作为统一索引上限 */
+	l3->indices = (max(max3(sc0, sc1, sc2), sc3) << 10) - 1;
+}
+/*
+ * ★ 这证明了 L3 Cache 在硬件上确实分为 4 个 subcache
+ *   每个 subcache 可以独立禁用特定的 index（用于 RAS 纠错）
+ *   resctrl 的 L3 Way Partitioning 也基于这 4 个 subcache
+ *
+ *   L3 (32 MB) 物理结构:
+ *   ┌──────────┬──────────┬──────────┬──────────┐
+ *   │ Subcache0│ Subcache1│ Subcache2│ Subcache3│
+ *   │  ~8 MB   │  ~8 MB   │  ~8 MB   │  ~8 MB   │
+ *   └──────────┴──────────┴──────────┴──────────┘
+ */
+```
 
 ---
 
@@ -684,6 +826,68 @@ lscpu | grep -i "NUMA\|node\|core"
       ├── 否 → NPS2 是个好的折中
       └── 是 → NPS4 + 手动 NUMA 绑定
                 配合 numactl --cpunodebind=N --membind=N
+```
+
+### 4.3 ★ NPS 配置的内核实现（源码佐证）
+
+NPS 配置通过 BIOS 设置 CPUID 0x8000001E ECX[10:8] 字段传递给操作系统，
+内核在启动早期解析此信息：
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/amd.c:36-41 */
+/*
+ * nodes_per_socket: Stores the number of nodes per socket.
+ * Refer to Fam15h Models 00-0fh BKDG - CPUID Fn8000_001E_ECX
+ * Node Identifiers[10:8]
+ */
+static u32 nodes_per_socket = 1;  /* ★ 默认 NPS1 */
+```
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/amd.c:569-578 */
+/* early_init_amd() 中: */
+	if (boot_cpu_has(X86_FEATURE_TOPOEXT)) {
+		u32 ecx;
+		ecx = cpuid_ecx(0x8000001e);
+		/* ★ ECX[10:8] = NodesPerSocket - 1 */
+		/* 值由 BIOS 根据 NPS 配置写入 */
+		nodes_per_socket = ((ecx >> 8) & 7) + 1;
+	}
+```
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/amd.c:375-378 */
+/* amd_get_topology() 中，多节点处理器的特殊处理: */
+	if (nodes_per_socket > 1) {
+		/* ★ NPS2/4 时标记为 Dual-Node Core */
+		set_cpu_cap(c, X86_FEATURE_AMD_DCM);
+		legacy_fixup_core_id(c);
+	}
+```
+
+```c
+/* 源码位置：arch/x86/kernel/cpu/amd.c:434-438 */
+/* 供其他子系统查询的导出函数 */
+u32 amd_get_nodes_per_socket(void)
+{
+	return nodes_per_socket;
+}
+EXPORT_SYMBOL_GPL(amd_get_nodes_per_socket);
+/*
+ * ★ 此函数被 NUMA 子系统、SRAT 解析等模块调用
+ *   用于确定每个 socket 有几个 NUMA 节点
+ *
+ *   NPS 配置与 nodes_per_socket 的对应关系:
+ *   ┌──────┬──────────────────┬──────────────────────────────┐
+ *   │ NPS  │ nodes_per_socket │ CPUID ECX[10:8] 值           │
+ *   ├──────┼──────────────────┼──────────────────────────────┤
+ *   │ NPS1 │ 1                │ 0 (0b000)                    │
+ *   │ NPS2 │ 2                │ 1 (0b001)                    │
+ *   │ NPS4 │ 4                │ 3 (0b011)                    │
+ *   └──────┴──────────────────┴──────────────────────────────┘
+ *   ★ 该值由 BIOS 写入 CPUID，内核只读取不修改
+ *     所以在 BIOS 中修改 NPS 配置 → CPUID 值改变 → 内核拓扑检测改变
+ */
 ```
 
 ---

@@ -27,6 +27,34 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### /proc/[pid]/ 目录注册机制（内核源码）
+
+```c
+/* 源码位置：src/linux-5.10/fs/proc/base.c:3159-3266 */
+/* ★ /proc/[pid]/ 下的每个虚拟文件都在这里注册
+ * 宏含义：ONE = 单次读取（调用 show 函数输出全部内容）
+ *        REG = 常规文件（有完整的 file_operations）
+ *        DIR = 子目录  LNK = 符号链接 */
+static const struct pid_entry tgid_base_stuff[] = {
+    DIR("task",       S_IRUGO|S_IXUGO, proc_task_inode_operations, ...),
+    DIR("fd",         S_IRUSR|S_IXUSR, proc_fd_inode_operations, ...),
+    REG("environ",    S_IRUSR, proc_environ_operations),
+    ONE("status",     S_IRUGO, proc_pid_status),       // ★ → proc_pid_status()
+    ONE("stat",       S_IRUGO, proc_tgid_stat),         // ★ → do_task_stat(whole=1)
+    ONE("statm",      S_IRUGO, proc_pid_statm),         // ★ → proc_pid_statm()
+    REG("maps",       S_IRUGO, proc_pid_maps_operations),
+    ONE("io",        S_IRUSR, proc_tgid_io_accounting), // ★ → do_io_accounting(whole=1)
+    ONE("schedstat",  S_IRUGO, proc_pid_schedstat),     // ★ → proc_pid_schedstat()
+    LNK("cwd",        proc_cwd_link),
+    LNK("root",       proc_root_link),
+    LNK("exe",        proc_exe_link),
+    // ... 更多文件注册 ...
+};
+```
+
+> **注意：** `proc_tgid_stat` 调用 `do_task_stat(m, ns, pid, task, 1)`，`whole=1` 表示聚合所有线程；
+> 线程级 `proc_tid_stat` 调用 `do_task_stat(m, ns, pid, task, 0)`，`whole=0` 表示单线程。
+
 ### 与 blktrace 的核心差异
 
 | 维度 | blktrace | pidstat |
@@ -75,6 +103,124 @@ $ cat /proc/1/stat
 **%CPU 计算公式：**
 ```
 %CPU = (utime_new - utime_old + stime_new - stime_old) / (interval × CLK_TCK) × 100
+```
+
+**内核源码：`do_task_stat()` 输出逻辑**
+
+```c
+/* 源码位置：src/linux-5.10/fs/proc/array.c:431-622 */
+/* ★ 这是 /proc/[pid]/stat 文件的核心输出函数
+ * whole=1 → 进程级（聚合所有线程）  whole=0 → 线程级 */
+static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
+                        struct pid *pid, struct task_struct *task, int whole)
+{
+    // ... 省略前置逻辑 ...
+
+    /* ★ 获取进程状态字符：'R', 'S', 'D', 'T' 等 */
+    state = *get_task_state(task);              // 行 451
+
+    /* 获取内存描述符 */
+    mm = get_task_mm(task);                     // 行 454
+
+    if (whole) {
+        /* ★ whole=1：遍历所有线程，累加 min_flt, maj_flt, utime, stime 等 */
+        struct task_struct *t = task;
+        min_flt = task->min_flt;
+        maj_flt = task->maj_flt;
+        // ... 累加所有线程的统计值 ...
+        while_each_thread(task, t) {
+            min_flt += t->min_flt;
+            maj_flt += t->maj_flt;
+            // ... gtime, utime, stime 也类似累加 ...
+        }                                       // 行 501-513
+    } else {
+        /* whole=0：直接取当前线程的值 */
+        min_flt = task->min_flt;
+        maj_flt = task->maj_flt;               // 行 524-528
+    }
+
+    /* ★ CPU 时间转换：纳秒 → clock_t（100Hz） */
+    task_cputime_adjusted(task, &utime, &stime);
+    /* task_cputime_adjusted 内部调用 nsec_to_clock_t()
+     * 将 task->utime / task->stime（纳秒）转换为 clock_t 单位 */
+
+    /* ★★★★★ 以下为 /proc/[pid]/stat 的 52 个字段输出 ★★★★★ */
+    seq_put_decimal_ull(m, "", pid_nr_ns(pid, ns));      // 字段 1:  pid
+    seq_puts(m, " (");
+    proc_task_name(m, task, false);                        // 字段 2:  comm（进程名，括号包裹）
+    seq_puts(m, ") ");
+    seq_putc(m, state);                                    // 字段 3:  state（R/S/D/T...）
+    seq_put_decimal_ll(m, " ", ppid);                      // 字段 4:  ppid（父进程 PID）
+    seq_put_decimal_ll(m, " ", pgid);                      // 字段 5:  pgid
+    seq_put_decimal_ll(m, " ", sid);                       // 字段 6:  sid
+    seq_put_decimal_ll(m, " ", tty_nr);                    // 字段 7:  tty_nr
+    seq_put_decimal_ll(m, " ", tty_pgrp);                  // 字段 8:  tty_pgrp
+    seq_put_decimal_ull(m, " ", task->flags);              // 字段 9:  flags
+    seq_put_decimal_ull(m, " ", min_flt);                  // 字段 10: ★ minflt（次页错误）
+    seq_put_decimal_ull(m, " ", cmin_flt);                 // 字段 11: cminflt
+    seq_put_decimal_ull(m, " ", maj_flt);                  // 字段 12: ★ majflt（主缺页）
+    seq_put_decimal_ull(m, " ", cmaj_flt);                 // 字段 13: cmajflt
+    seq_put_decimal_ull(m, " ", nsec_to_clock_t(utime));   // 字段 14: ★ utime
+    seq_put_decimal_ull(m, " ", nsec_to_clock_t(stime));   // 字段 15: ★ stime
+    seq_put_decimal_ll(m, " ", nsec_to_clock_t(cutime));   // 字段 16: cutime
+    seq_put_decimal_ll(m, " ", nsec_to_clock_t(cstime));   // 字段 17: cstime
+    seq_put_decimal_ll(m, " ", priority);                  // 字段 18: priority
+    seq_put_decimal_ll(m, " ", nice);                      // 字段 19: nice
+    seq_put_decimal_ll(m, " ", num_threads);               // 字段 20: num_threads
+    seq_put_decimal_ull(m, " ", 0);                        // 字段 21: it_real_value（已废弃）
+    seq_put_decimal_ull(m, " ", start_time);               // 字段 22: starttime
+    seq_put_decimal_ull(m, " ", vsize);                    // 字段 23: vsize（虚拟内存字节数）
+    seq_put_decimal_ull(m, " ", mm ? get_mm_rss(mm) : 0);  // 字段 24: rss（常驻集页数）
+    // ... 字段 25-38: 内存地址、信号、wchan 等（pidstat 不关心）...
+    seq_put_decimal_ll(m, " ", task_cpu(task));             // 字段 39: ★ processor（最后运行的 CPU）
+    seq_put_decimal_ull(m, " ", task->rt_priority);        // 字段 40: rt_priority
+    seq_put_decimal_ull(m, " ", task->policy);             // 字段 41: policy
+    seq_put_decimal_ull(m, " ", delayacct_blkio_ticks(task)); // 字段 42: ★ delayacct（I/O 延迟）
+    seq_put_decimal_ull(m, " ", nsec_to_clock_t(gtime));   // 字段 43: ★ guest_time
+    // ... 字段 44-52 ...
+}
+```
+
+> **源码验证：** 字段 14/15 的 utime/stime 在输出前经过 `nsec_to_clock_t()` 转换，
+> 证实了"clock_t 单位"的结论。内核内部存储为纳秒（`task->utime` 类型为 `u64`），
+> 输出时除以 `NSEC_PER_SEC / USER_HZ` 得到 clock_t。
+
+**内核源码：task_struct 中对应的字段定义**
+
+```c
+/* 源码位置：src/linux-5.10/include/linux/sched.h */
+struct task_struct {
+    /* -1 unrunnable, 0 runnable, >0 stopped: */
+    volatile long           state;          // ★ 行 649：进程状态
+
+    // ... 中间省略数百行 ...
+
+    struct mm_struct        *mm;            // ★ 行 757：内存描述符指针
+    struct mm_struct        *active_mm;
+
+    u64                     utime;          // ★ 行 884：用户态 CPU 时间（纳秒）
+    u64                     stime;          // ★ 行 885：内核态 CPU 时间（纳秒）
+    u64                     gtime;          // ★ 行 890：虚拟机 guest 时间（纳秒）
+    struct prev_cputime     prev_cputime;   // 行 891：上次快照（用于调整精度）
+
+    /* Context switch counts: */
+    unsigned long           nvcsw;          // ★ 行 900：自愿上下文切换次数
+    unsigned long           nivcsw;         // ★ 行 901：非自愿上下文切换次数
+
+    /* MM fault and swap info: */
+    unsigned long           min_flt;        // ★ 行 910：次缺页（minor fault）累积计数
+    unsigned long           maj_flt;        // ★ 行 911：主缺页（major fault）累积计数
+
+    /*
+     * executable name, excluding path.
+     * - normally initialized setup_new_exec()
+     * - access it with [gs]et_task_comm()
+     * - lock it with task_lock()
+     */
+    char                    comm[TASK_COMM_LEN]; // ★ 行 943：进程名（16字节）
+
+    struct task_io_accounting   ioac;       // ★ 行 1067：I/O 统计结构体
+};
 ```
 
 ### 2.2 /proc/[pid]/io — I/O 字节数
