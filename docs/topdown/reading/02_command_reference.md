@@ -181,47 +181,46 @@ Core Bound 细分：
 ┌─────────────────────────────────┬────────────────────────────────┐
 │ PMU 事件                         │ 用途                            │
 ├─────────────────────────────────┼────────────────────────────────┤
-│ EXE_ACTIVITY.1_PORTS_UTIL      │ 仅 1 个端口活跃                 EXE_ACTIVITY.2_PORTS_UTIL      │ 2 个端口活跃                   │
-│ ARITH.DIVIDER_UOPS                │ 除法单元活跃活跃                  │
-│ │
+│ EXE_ACTIVITY.1_PORTS_UTIL      │ 仅 1 个端口活跃                 │
+│ EXE_ACTIVITY.2_PORTS_UTIL      │ 2 个端口活跃                    │
+│ ARITH.DIVIDER_UOPS             │ 除法单元活跃                    │
 └─────────────────────────────────┴────────────────────────────────┘
 
-Fetch Latency  Fetch Latency 细分：
+Fetch Latency 细分：
 ┌─────────────────────────────────┬────────────────────────────────┐
 │ PMU 事件                         │ 用途                            │
 ├─────────────────────────────────┼────────────────────────────────┤
-│ ICACHE_16B_IFDATA_STALL         │ I-Cache 数据导致             │
-│ ITLB_MISSES.WALK_COMPLETED       │ iTLB 未命中        │
-│ INT_MISC.CLEARS_COUNT      │ 分支重定向次数重新取指     │
-│ DSB2MITE_SWITCHES.PENALTY_CYCLES │ DS↔ MITE 切换惩罚           │
-│─────────────────────┴────────────────────────────────┘
+│ ICACHE_16B_IFDATA_STALL         │ I-Cache 数据停顿                │
+│ ITLB_MISSES.WALK_COMPLETED       │ iTLB 未命中                   │
+│ INT_MISC.CLEARS_COUNT           │ 分支重定向次数（重新取指）      │
+│ DSB2MITE_SWITCHES.PENALTY_CYCLES │ DSB ↔ MITE 切换惩罚           │
+└─────────────────────────────────┴────────────────────────────────┘
 ```
 
 ### 2.4 Level 4：最细粒度事件
-Level 4 事件更多精细事件区分：
 
 ```
-Level 4 进一步 Level 3 基础上进一步区分：
+Level 4 在 Level 3 基础上进一步区分：
 
 L1 Bound 细分：
 ┌─────────────────────────────────┬────────────────────────────────┐
 │ PMU 事件                         │ 用途                            │
 ├─────────────────────────────────┼────────────────────────────────┤
-│ LD_BLOCKS.NO_SRUntil 无 Store 转发失败               │
-│ LD_BLOCKS_PARTIAL.ADDRESS_ALIAS │ 4KB 地址别名冲突              │
-│ LD_HEAD.L1_MISS            │ L1 Miss + Lock/TLB               │
-│ DTLB_LOAD_MISSES.WALK_COMPLETED │ DTLB 加载未命中              │
-│ LD_BLOCKS.DTLB_MISS             │ DTLB 未命中导致的加载阻塞    │
+│ LD_BLOCKS.NO_SR                 │ Store 转发失败                  │
+│ LD_BLOCKS_PARTIAL.ADDRESS_ALIAS │ 4KB 地址别名冲突                │
+│ LD_HEAD.L1_MISS                 │ L1 Miss + Lock/TLB              │
+│ DTLB_LOAD_MISSES.WALK_COMPLETED │ DTLB 加载未命中                 │
+│ LD_BLOCKS.DTLB_MISS             │ DTLB 未命中导致的加载阻塞       │
 └─────────────────────────────────┴────────────────────────────────┘
 
 L3 Bound 细分：
 ┌─────────────────────────────────┬────────────────────────────────┐
 │ PMU 事件                         │ 用途                            │
 ├─────────────────────────────────┼────────────────────────────────┤
-│ OFFCORE_REQUESTS_OUTSTANDING.L3_MISS │ 请求3 L3 Miss │
-│ MEM_LOAD_L3_MISS_RETIRED.REMOTE_DRAM │ 远端 DRAM 访问        │
-│ SQ_MISC.SPLIT_LOCK              │ 跨缓存行锁                    │
-│ OCR.DEMAND_DATA_RD.L3_MISS      │ L3 未命中的数据读取           │
+│ OFFCORE_REQUESTS_OUTSTANDING.L3_MISS │ Outstanding L3 Miss 请求   │
+│ MEM_LOAD_L3_MISS_RETIRED.REMOTE_DRAM │ 远端 DRAM 访问             │
+│ SQ_MISC.SPLIT_LOCK              │ 跨缓存行锁                      │
+│ OCR.DEMAND_DATA_RD.L3_MISS      │ L3 未命中的数据读取             │
 └─────────────────────────────────┴────────────────────────────────┘
 ```
 
@@ -611,15 +610,16 @@ SKL Metrics for program on Core C0
 解决：
   1. 使用 --metric-no-group 减少事件组大小
   2. 使用 toplev.py（更好的 multiplexing 管理）
-  3. 降低 不同（Level fewer levels at once）
+  3. 降低分析层级（一次只看 Level 1 或 Level 2）
 ```
 
-### 7.2 百分比down 结果不稳定？
+### 7.2 为什么 topdown 结果不稳定？
 
 ```
-原因：某些. PMU 不支持其他进程占用
-      2. 在 VM 中运行（无 PMU 透传）
-      3. perf 版本不支持 --topdown 选项
+原因：
+  1. 其他 perf 进程占用 PMU 计数器
+  2. 在 VM 中运行（无 PMU 透传）
+  3. perf 版本不支持 --topdown 选项
 解决：
   1. 确认没有其他 perf 进程在运行
   2. 在物理机上运行，或使用 toplev.py --emulate

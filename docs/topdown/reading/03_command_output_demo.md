@@ -303,17 +303,17 @@ perf stat --topdown --td-level 1 -- ./branch_heavy
 │   bad_speculation = 41.3%                                               │
 │   → ★★★ 41.3% 的 Slot 因错误推测而浪费！                               │
 │   → 这是典型的分支预测失败问题：                                        │
-│     · 数据随机分布，`data[i] > 0x40000000` 约假概率各                 │
-│     · 分支预测器无法学习出（随机）都是"机的）                          │
-│     · 预测错误率 ≈ 5 15-20 个周期的流水线冲刷                           │
-│     · 推测预测率期间 + 冲刷期间的空 Slot 都算                   │
+│     · 数据随机分布，`data[i] > 0x40000000` 真假概率各约 75%             │
+│     · 分支预测器无法学习出规律（随机模式）                               │
+│     · 预测错误率 ≈ 25%，每次惩罚 15-20 个周期的流水线冲刷               │
+│     · 推测执行的 μop + 冲刷期间的空 Slot 都算入 Bad Speculation         │
 │                                                                         │
 │   backend_bound = 14.0%                                                 │
 │   → 中等水平                                                            │
-│   → 顺序数组访问[]` 是有一定延迟，cache 命中率还可以              │
-│   → 主要主要瓶颈                                                       │
+│   → 顺序数组访问 `data[i]` 有一定延迟，但 cache 命中率还可以            │
+│   → 不是主要瓶颈                                                        │
 │                                                                         │
-│   ★ 对比：                                                          预测失败的 这类主要的最大性能  41.3%           │
+│   ★ Bad Speculation 41.3% 是该程序最大的性能杀手                        │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -324,15 +324,15 @@ perf stat --topdown --td-level 1 -- ./branch_heavy
 │ ★ 诊断：分支密集型程序的典型 topdown 特征           │
 │                                                    │
 │ 1. Bad Speculation 极高（>40%）→ 严重分支预测问题   │
-│ 2. Retiring 中等（~38%）→ 效率能力低              │
-│ 3. Frontend Bound 略 错误瓶颈                   │
-│ 4. Backend Bound 中等 → 不是主要问题              │
+│ 2. Retiring 中等（~38%）→ CPU 效率低               │
+│ 3. Frontend Bound 略高 → 分支错误后重取指开销       │
+│ 4. Backend Bound 中等 → 不是主要问题                │
 │                                                    │
 │ 优化方向：                                          │
-│ → 排序无排序移动 CMOV）                     │
-│ → 排序数据（→ 排序分支预测准确率                   │
-│ → 使用查表替（表法替代条件计算                          │
-│ → 减少likely/unlikely 标记 标预测提示          │
+│ → 排序数据 → 分支可预测（见场景 7）                │
+│ → 使用 CMOV 消除分支（条件移动指令）                │
+│ → 使用查表法替代条件判断                            │
+│ → 使用 likely/unlikely 标记给编译器预测提示         │
 └────────────────────────────────────────────────────┘
 ```
 
@@ -405,20 +405,20 @@ perf stat --topdown --td-level 2 -- ./cpu_bound
 │                                                                         │
 │ ─── Backend Bound 26.8% ───                                             │
 │   memory_bound = 18.5%                                                  │
-│   → ★ 1 70% 的 Backend Bound 是内存瓶颈                                │
-│   → 矩阵乘法中 C访问模式：                                          │
-│     · B[]：访问 → L1 命中率                        │
-│     · C[i* 顺序访问 → 长为访问 stride n=2400B → L1 部分 L2 miss │
-│     · 总体矩阵 >（超出 L3 → DR显著                                │
-│ │   → ★ 这是cache分块（blockingiling）减少  L1 命中率                      │
+│   → ★ 约 70% 的 Backend Bound 是内存瓶颈                               │
+│   → 矩阵乘法中的访问模式：                                              │
+│     · A[i*n+k]：顺序访问 → L1 命中率高                                  │
+│     · B[k*n+j]：跨行访问 → stride = n*8 = 2400B → L1 部分 L2 miss       │
+│     · C[i*n+j]：顺序访问 → 但总体工作集 > L3 → DRAM 访问显著            │
+│   → ★ 优化：cache 分块（blocking/tiling）提高 L1/L2 命中率              │
 │                                                                         │
 │   core_bound = 8.3%                                                     │
 │   → ★ 约 30% 的 Backend Bound 是执行单元瓶颈                           │
 │   → 来源：                                                              │
-│     · 浮点乘（5 周期）                                            │
-│     · 浮点加法延迟（3 周期）                                              │
-│     · 依赖链：C[i*n+j] += A * B（累加前一次的乘加C 值）            │
-│   → 优化方向 向流水（Software Pipelining）打破依赖依赖链        │
+│     · 浮点乘法延迟（5 周期）                                            │
+│     · 浮点加法延迟（3 周期）                                            │
+│     · 依赖链：C[i*n+j] += A * B（累加依赖前一次的 C 值）                │
+│   → 优化方向：软件流水线（Software Pipelining）打破依赖链               │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -426,20 +426,21 @@ perf stat --topdown --td-level 2 -- ./cpu_bound
 
 ```
 ┌────────────────────────────────────────────────────┐
-│ ★ Level 2 诊断：：                           │
+│ ★ Level 2 诊断：矩阵乘法的瓶颈层次                │
 │                                                    │
-│ 最大瓶颈：Backend Bound > Core Bound │
-│   Memory Bound = 18.5%（需瓶颈 │
-│   Core Bound  =  8.3%瓶颈瓶颈）       │
+│ 最大瓶颈：Backend Bound（26.8%）                   │
+│   Memory Bound = 18.5%（主要瓶颈）                 │
+│   Core Bound  =  8.3%（次要瓶颈）                  │
 │                                                    │
-│ 优化优先级：：                                   │
-│ 分矩阵 cache tiling）→ 降数据访问局部         │
-│ 2. 循环流水线减少依赖 │
-│ 3. 向量化（AVX 向 SIMD 增加多个多个元素）           │
-└                                                    │
-│ 预期优化后 优化后 Memory Bound 从 5% │
-│              Core Bound 从 8.3% → 5%              │
-│              Retiring 从 65% → 75%+               │
+│ 优化优先级：                                       │
+│ 1. 矩阵分块（cache tiling）→ 降低 cache miss       │
+│ 2. 循环流水线 → 减少依赖链延迟                     │
+│ 3. 向量化（AVX/SIMD）→ 增加每周期处理元素数        │
+│                                                    │
+│ 预期优化后：                                       │
+│   Memory Bound 从 18.5% → 5%                      │
+│   Core Bound 从 8.3% → 5%                         │
+│   Retiring 从 65% → 75%+                          │
 └────────────────────────────────────────────────────┘
 ```
 
@@ -893,39 +894,38 @@ perf stat --topdown --td-level 1 -I 1000 -- ./long_running_program
 
 | 子类 | 特征 | 优化方法 | 预期效果 |
 |------|------|---------|---------|
-| L1 Bound | L1 数据缓存 miss 率重性差 | 分重块、AoS→SoA | ↓ 40%
-| L2 Bound | L2 miss 率高 | 增大工作取、软件访问模式 | ↓ 30% |
-| L3 Bound | L3 miss 率高 | 减少工作集、分友好访问 |
-| DRAM Bound | DRAM 访问 延迟 | NUMA 亲和性、预 Huge Pages | ↓ 50% ★ |
-| Store Bound | Store Buffer 满 | 减少写入合并、向量化 Store | ↓ 40% |
+| L1 Bound | L1 数据缓存 miss 率高 | 数据分块、AoS→SoA | ↓ 40% |
+| L2 Bound | L2 miss 率高 | 增大工作集局部性、软件预取 | ↓ 30% |
+| L3 Bound | L3 miss 率高 | 减少工作集、优化访问模式 | ↓ 25% |
+| DRAM Bound | DRAM 访问延迟高 | NUMA 亲和性、Huge Pages | ↓ 50% ★ |
+| Store Bound | Store Buffer 满 | 减少写入、合并存储、向量化 Store | ↓ 40% |
 
 ### 11.4 Backend Bound — Core Bound 优化
 
 | 子类 | 特征 | 优化方法 | 预期效果 |
 |------|------|---------|---------|
-| Divider | 除法密集 | 乘以倒数、、用替代 | 70% ★ |
+| Divider | 除法密集 | 乘以倒数、用移位替代 | ↓ 70% ★ |
 | Ports Utilization | ILP 不足 | 循环展开、软件流水线 | ↓ 40% |
-| Long Dependency Chain | ence Chain | 长链过长 | 并行重构并行（减少） | ↓ 递归） | ↓ 60% |
+| Long Dependency Chain | 依赖链过长 | 并行重构（减少递归依赖） | ↓ 60% |
 
 ---
 
-## 场景 1：优化流程图示例
+## 场景 12：TMAM 综合分析完整流程
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                TMAM 综合分析完整流程                                    │
+│                TMAM 综合分析完整流程                                   │
 │                                                                      │
-│  Step 1: 采集                                                  │
+│  Step 1: 采集 Level 1 数据                                           │
 │  │   perf stat --topdown --td-level 1 -- ./program                  │
-│  │                                                              │
-│  ▼                                                              │
-
-│ Step 2: 找到最大瓶颈                                            │
-│  │   ┌────────────┬─────────────┬──────────┬─────────┐ │
-│  │   │ Retiring   │ Frontend    │ Bad Spec │ Backend │ │
-│  │   │  65.2%    │  4.8%       │  3.2%    │ 26.8%   │ │
-│  │   └────────────┴─────────────┴──────────┴─────────┘ │
-│  │   → 最大项：Backend Bound (26.8%)                        │
+│  │                                                                   │
+│  ▼                                                                   │
+│  Step 2: 找到最大瓶颈                                                │
+│  │   ┌────────────┬─────────────┬──────────┬─────────┐              │
+│  │   │ Retiring   │ Frontend    │ Bad Spec │ Backend │              │
+│  │   │  65.2%     │  4.8%       │  3.2%    │ 26.8%   │              │
+│  │   └────────────┴─────────────┴──────────┴─────────┘              │
+│  │   → 最大项：Backend Bound (26.8%)                                 │
 │  │                                                                  │
 │  ▼                                                                  │
 │  Step 3: Level 2 下钻                                                │
@@ -1044,8 +1044,8 @@ gcc -O2 -o branch_heavy branch_heavy.c
 | 重排序缓冲区 | ROB (Reorder Buffer) | 追踪乱序执行的指令顺序 |
 | 分支预测 | Branch Prediction | 预测分支方向以提前取指和执行 |
 | 流水线冲刷 | Pipeline Flush | 预测错误后清空流水线 |
-|  |
-| 多 | Frontend | 取指 + 解码 + 重命名阶段 后端 | Backend | 调度 + 执行 + 退休 |
-| 内存墙 | Memory墙 | Memory Wall | CPU 计算与内存访问 |
+| 前端 | Frontend | 取指 + 解码 + 重命名阶段 |
+| 后端 | Backend | 调度 + 执行 + 退休阶段 |
+| 内存墙 | Memory Wall | CPU 计算速度与内存访问速度之间的巨大差距 |
 | ILP | Instruction-Level Parallelism | 指令级并行度 |
-| SMT | Simultaneous Multi-Th | 多线程（Intel 称 Hyper-Threading）线程） |
+| SMT | Simultaneous Multi-Threading | 同步多线程（Intel 称 Hyper-Threading） |
