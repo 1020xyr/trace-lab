@@ -8,6 +8,8 @@
 
 - [Q1: 如何用 perf 判断是 L3 cache miss 还是 CPU 计算瓶颈？](#q1-如何用-perf-判断是-l3-cache-miss-还是-cpu-计算瓶颈)
 - [Q2: perf c2c 如何检测 false sharing？](#q2-perf-c2c-如何检测-false-sharing)
+- [Q3: perf stat 显示 IPC < 1 但 cache-miss 率正常，可能是什么原因？](#q3-perf-stat-显示-ipc--1-但-cache-miss-率正常可能是什么原因)
+- [Q4: perf record 报 "perf_event_paranoid" 错误怎么解决？](#q4-perf-record-报-perf_event_paranoid-错误怎么解决)
 
 ---
 
@@ -139,6 +141,171 @@ struct __attribute__((aligned(64))) {
 ```
 
 **★ 注意：** `perf c2c` 需要物理机（PEBS/IBS 支持），在 KVM 虚拟机中可能不可用。
+
+---
+
+## Q3: perf stat 显示 IPC < 1 但 cache-miss 率正常，可能是什么原因？
+
+**日期：** 2026-07-04
+**场景：** `perf stat` 发现 IPC 只有 0.3~0.8，但 cache-miss 率只有 2~5%，不是 cache 的问题，那到底是什么拖慢了 CPU？
+**相关文件：** `reading/06_hw_counters_diagnosis.md`
+
+### 回答
+
+IPC < 1 意味着 CPU 每个周期平均退休不到 1 条指令。cache miss 只是众多原因之一。perf 源码中的 **Topdown 方法**将所有停顿分为 4 大类，这是 Intel 提出的系统化分析框架。
+
+#### 1. Topdown 四大分类
+
+perf 通过 `--topdown` 选项支持 Topdown Level 1 分析。事件定义在源码中：
+
+```c
+// tools/perf/builtin-stat.c:131-137
+static const char *topdown_metric_attrs[] = {
+    "slots",
+    "topdown-retiring",      // 有效退休（好事）
+    "topdown-bad-spec",      // 错误推测（分支预测失败等）
+    "topdown-fe-bound",      // 前端瓶颈（指令获取跟不上）
+    "topdown-be-bound",      // 后端瓶颈（执行资源不足）
+    NULL,
+};
+```
+
+对应 Skylake 架构的指标公式（`tools/perf/pmu-events/arch/x86/skylake/skl-metrics.json`）：
+
+| Topdown 分类 | 公式（简化版） | 含义 |
+|-------------|-------------|------|
+| **Retiring** | `UOPS_RETIRED.RETIRE_SLOTS / (4 * cycles)` | 有效工作占比 |
+| **Bad_Speculation** | `(UOPS_ISSUED - UOPS_RETIRED + 4 * INT_MISC.RECOVERY_CYCLES) / (4 * cycles)` | 因错误推测浪费的 slot |
+| **Frontend_Bound** | `IDQ_UOPS_NOT_DELIVERED.CORE / (4 * cycles)` | 前端无法喂饱后端 |
+| **Backend_Bound** | `1 - (FE + BadSpec + Retiring)` | 后端资源不足 |
+
+> ★ **关键理解：** Skylake 每周期最多发出 4 个 uop，所以总 slot = 4 × cycles。IPC < 1 说明大量 slot 被浪费。
+
+#### 2. IPC < 1 但 cache-miss 正常的常见原因
+
+```
+┌─────────────────────────────────────────────────┐
+│              CPU Pipeline Slot 去向              │
+│  4 slots/cycle = Retiring + Bad_Spec            │
+│                  + Frontend_Bound + Backend_Bound│
+│                                                 │
+│  IPC = Retiring × 4 (近似)                      │
+│                                                 │
+│  IPC < 1 的 5 大原因（cache-miss 只是其中一个）： │
+│                                                 │
+│  ① 分支预测失败 (Bad_Spec)                       │
+│  ② TLB miss (Backend_Bound → Memory)            │
+│  ③ 指令缓存 miss (Frontend_Bound)               │
+│  ④ 执行端口争用 (Backend_Bound → Core)           │
+│  ⑤ 数据依赖链 (Backend_Bound → Core)             │
+└─────────────────────────────────────────────────┘
+```
+
+**详细分析：**
+
+| 原因 | Topdown 分类 | cache-miss 表现 | 诊断事件 |
+|------|-------------|----------------|---------|
+| **分支预测失败** | Bad_Speculation | 正常 | `branch-misses`、`INT_MISC.RECOVERY_CYCLES` |
+| **dTLB/iTLB miss** | Backend_Bound (Memory) | 正常 | `dTLB-load-misses`、`iTLB-load-misses` |
+| **指令缓存 miss** | Frontend_Bound | 正常 | `L1-icache-load-misses`、`stalled-cycles-frontend` |
+| **执行端口争用** | Backend_Bound (Core) | 正常 | `CYCLE_ACTIVITY.STALLS_TOTAL`、`UOPS_ISSUED.ANY` |
+| **长依赖链** | Backend_Bound (Core) | 正常 | `CYCLE_ACTIVITY.STALLS_TOTAL` |
+| **L3 cache miss** | Backend_Bound (Memory) | ★ 高 | `LLC-load-misses`、`CYCLE_ACTIVITY.STALLS_L3_MISS` |
+
+#### 3. 源码验证：stalled-cycles 前后端分离
+
+内核将停顿事件分为前端和后端两类，定义在硬件事件枚举中：
+
+```c
+// include/uapi/linux/perf_event.h:56-57
+PERF_COUNT_HW_STALLED_CYCLES_FRONTEND = 7,  // 前端停顿周期
+PERF_COUNT_HW_STALLED_CYCLES_BACKEND  = 8,  // 后端停顿周期
+```
+
+perf stat 输出时的颜色阈值设定（`tools/perf/util/stat-shadow.c:304-306`）：
+
+```c
+// 不同停顿类型的颜色告警阈值（百分比）
+static const double grc_table[GRC_MAX_NR][3] = {
+    [GRC_STALLED_CYCLES_FE] = { 50.0, 30.0, 10.0 },  // >50% 红色
+    [GRC_STALLED_CYCLES_BE] = { 75.0, 50.0, 20.0 },  // >75% 红色
+    [GRC_CACHE_MISSES]      = { 20.0, 10.0, 5.0  },   // >20% 红色
+};
+```
+
+> ★ **注意：** 后端停顿阈值（75% 才红色）远高于前端（50%），说明后端停顿更"常见"——因为 cache miss、内存访问都算后端停顿。
+
+#### 4. 分支预测失败的代价
+
+分支预测失败属于 **Bad_Speculation**，perf 用 `INT_MISC.RECOVERY_CYCLES` 事件追踪恢复周期：
+
+```json
+// tools/perf/pmu-events/arch/x86/skylake/pipeline.json:73-76
+{
+    "EventName": "INT_MISC.RECOVERY_CYCLES",
+    "BriefDescription": "Core cycles the allocator was stalled due to recovery
+                         from earlier clear event for this thread
+                         (e.g. misprediction or memory nuke)"
+}
+```
+
+每次分支预测失败，CPU 需要 **15~20 个周期**清空流水线并重新从正确路径取指。如果程序有大量不可预测的分支（如哈希表查找、随机数据），即使 cache 完全命中，IPC 也会很低。
+
+#### 5. 实战诊断命令
+
+```bash
+# Step 1: 基本 stat + stalled-cycles 分析
+perf stat -e cycles,instructions,cache-misses,cache-references,\
+    stalled-cycles-frontend,stalled-cycles-backend,\
+    branch-misses,branch-instructions,\
+    dTLB-load-misses,dTLB-loads,\
+    iTLB-load-misses,iTLB-loads,\
+    L1-icache-load-misses ./app
+
+# Step 2: Topdown 分析（Intel CPU 需要 perf ≥ 4.10）
+perf stat --topdown -a -- sleep 5
+
+# Step 3: 如果 stalled-frontend 高，深入检查指令缓存
+perf stat -e L1-icache-loads,L1-icache-load-misses,\
+    cycles:u,cycles:k ./app
+
+# Step 4: 如果 stalled-backend 高但 cache-miss 正常，检查 TLB 和依赖链
+perf stat -e dTLB-load-misses,dTLB-loads,\
+    iTLB-load-misses,iTLB-loads,\
+    L1-dcache-loads,L1-dcache-load-misses,\
+    LLC-loads,LLC-load-misses ./app
+```
+
+#### 6. 诊断决策树
+
+```
+perf stat 显示 IPC < 1
+│
+├── cache-miss 率 > 15%?
+│   └── YES → L3 cache miss 是瓶颈（见 Q1）
+│
+├── stalled-cycles-frontend > 30%?
+│   └── YES → 前端瓶颈
+│       ├── L1-icache-load-misses 高? → 指令缓存 miss（代码太大/太分散）
+│       └── iTLB-load-misses 高? → iTLB miss（代码页太多）
+│
+├── branch-miss 率 > 5%?
+│   └── YES → 分支预测失败（Bad_Speculation）
+│       └── 优化：减少不可预测分支，用 cmov、查表等
+│
+├── dTLB-load-miss 率高?
+│   └── YES → TLB miss（大内存随机访问）
+│       └── 优化：使用大页（hugepage）、减少工作集
+│
+├── stalled-cycles-backend > 50% 但 cache/TLB 正常?
+│   └── YES → 执行端口争用或数据依赖链
+│       └── 优化：减少依赖链深度，提高 ILP
+│
+└── 以上都正常?
+    └── 检查 --topdown 输出，可能有微码 assist 或锁竞争
+```
+
+**★ 一句话总结：** IPC < 1 + cache-miss 正常 = 问题不在 cache，用 `perf stat --topdown` 定位是分支预测失败（Bad_Speculation）、前端饥饿（Frontend_Bound）、还是后端执行瓶颈（Backend_Bound/Core），再针对性优化。
 
 ---
 

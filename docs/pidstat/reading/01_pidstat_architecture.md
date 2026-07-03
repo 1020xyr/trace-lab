@@ -596,6 +596,85 @@ pidstat 如何找到所有进程？
     pidstat 读取 + 差值计算 → 输出表格
 ```
 
+**内核源码：内存统计的计算（VmSize / VmRSS 的来源）**
+
+```c
+/* 源码位置：src/linux-5.10/fs/proc/task_mmu.c:87-98 */
+/* ★ /proc/[pid]/statm 和 /proc/[pid]/status 中内存字段的底层计算 */
+unsigned long task_statm(struct mm_struct *mm,
+                         unsigned long *shared, unsigned long *text,
+                         unsigned long *data, unsigned long *resident)
+{
+    /* ★ 共享页 = 文件映射页 + 共享内存页 */
+    *shared = get_mm_counter(mm, MM_FILEPAGES) +
+              get_mm_counter(mm, MM_SHMEMPAGES);
+
+    /* ★ 代码段大小 = (end_code - start_code) / 页大小 */
+    *text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK))
+                                                        >> PAGE_SHIFT;
+
+    /* ★ 数据段 = 数据 VM + 栈 VM */
+    *data = mm->data_vm + mm->stack_vm;
+
+    /* ★ 驻留页 = 共享页 + 匿名页（malloc/mmap MAP_ANONYMOUS） */
+    *resident = *shared + get_mm_counter(mm, MM_ANONPAGES);
+
+    /* ★ 返回值 = 总虚拟内存页数 → VmSize 的来源 */
+    return mm->total_vm;
+}
+```
+
+```c
+/* 源码位置：src/linux-5.10/fs/proc/array.c:636-669 */
+/* ★ /proc/[pid]/statm 输出函数 —— 调用 task_statm() 获取数据 */
+int proc_pid_statm(struct seq_file *m, struct pid_namespace *ns,
+                   struct pid *pid, struct task_struct *task)
+{
+    struct mm_struct *mm = get_task_mm(task);
+    if (mm) {
+        unsigned long size, resident = 0, shared = 0, text = 0, data = 0;
+        size = task_statm(mm, &shared, &text, &data, &resident);
+        mmput(mm);
+        /* 输出格式: "size resident shared text 0 data 0\n"
+         *           所有值单位为页面数（通常 4KB/页） */
+        seq_put_decimal_ull(m, "", size);         // 字段 1: size（= VmSize / PAGE_SIZE）
+        seq_put_decimal_ull(m, " ", resident);    // 字段 2: resident（≈ VmRSS / PAGE_SIZE）
+        seq_put_decimal_ull(m, " ", shared);      // 字段 3: shared
+        seq_put_decimal_ull(m, " ", text);        // 字段 4: text
+        seq_put_decimal_ull(m, " ", 0);           // 字段 5: lib（始终 0）
+        seq_put_decimal_ull(m, " ", data);        // 字段 6: data + stack
+        seq_put_decimal_ull(m, " ", 0);           // 字段 7: dt（始终 0）
+        seq_putc(m, '\n');
+    } else {
+        seq_write(m, "0 0 0 0 0 0 0\n", 14);  // 内核线程无 mm，全零
+    }
+    return 0;
+}
+```
+
+**完整映射表：task_struct → /proc 文件 → pidstat 列**
+
+| task_struct 字段 | 源码行号 | /proc 文件 | pidstat 列 |
+|---|---|---|---|
+| `state` | sched.h:649 | stat 字段 3 | State 列（R/S/D/T/Z） |
+| `comm[]` | sched.h:943 | stat 字段 2 | Command 列 |
+| `utime` | sched.h:884 | stat 字段 14 | %usr |
+| `stime` | sched.h:885 | stat 字段 15 | %system |
+| `gtime` | sched.h:890 | stat 字段 43 | %guest |
+| `min_flt` | sched.h:910 | stat 字段 10 | minflt/s |
+| `maj_flt` | sched.h:911 | stat 字段 12 | majflt/s |
+| `nvcsw` | sched.h:900 | status voluntary_ctxt_switches | cswch/s |
+| `nivcsw` | sched.h:901 | status nonvoluntary_ctxt_switches | nvcswch/s |
+| `ioac.read_bytes` | task_io_accounting.h:35 | io read_bytes | kB_rd/s |
+| `ioac.write_bytes` | task_io_accounting.h:36 | io write_bytes | kB_wr/s |
+| `ioac.cancelled_write_bytes` | task_io_accounting.h:37 | io cancelled_write_bytes | kB_ccwr/s |
+| `se.sum_exec_runtime` | — | schedstat 字段 1 | — (交叉验证) |
+| `sched_info.run_delay` | — | schedstat 字段 2 | %wait |
+| `sched_info.pcount` | — | schedstat 字段 3 | — (调度次数) |
+| `mm->total_vm` | — | statm 字段 1 / status VmSize | VSZ |
+| `mm` (RSS 计算) | — | statm 字段 2 / status VmRSS | RSS |
+| `task_cpu(task)` | — | stat 字段 39 | CPU 列 |
+
 ---
 
 ## 六、关键限制

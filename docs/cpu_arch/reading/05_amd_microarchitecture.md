@@ -4,13 +4,22 @@
 ======================================================================
   来源: AMD PPR (Processor Programming Reference)、AMD Software
         Optimization Guide、Linux 内核文档、Agner Fog 微架构手册
+  内核源码引用:
+    - arch/x86/kernel/cpu/amd.c      (AMD 拓扑检测: amd_detect_cmp,
+                                       amd_get_topology, nodes_per_socket)
+    - arch/x86/kernel/cpu/topology.c (通用拓扑解析: detect_extended_topology)
+    - arch/x86/kernel/cpu/cacheinfo.c(AMD 缓存枚举: cacheinfo_amd_init_llc_id,
+                                       cpuid4_cache_lookup_regs,
+                                       amd_calc_l3_indices)
+    - arch/x86/include/asm/cpufeatures.h (X86_FEATURE_TOPOEXT 定义)
   阅读要点:
     - CCD（Core Complex Die）和 CCX（Core Complex Chiplet）拓扑
     - 8 核共享 32MB L3 Cache 的含义与性能影响
     - NUMA node per socket vs NPS（Node Per Socket）配置
     - AMD vs Intel 的关键架构差异
     - Infinity Fabric 互连与跨 CCD 延迟
-  预计时间: 30-40 分钟
+    - ★ 内核如何通过 CPUID 0x8000001E/0x8000001D 检测上述拓扑
+  预计时间: 40-50 分钟
 ======================================================================
 -->
 
@@ -828,7 +837,7 @@ lscpu | grep -i "NUMA\|node\|core"
                 配合 numactl --cpunodebind=N --membind=N
 ```
 
-### 4.3 ★ NPS 配置的内核实现（源码佐证）
+### 4.4 ★ NPS 配置的内核实现（源码佐证）
 
 NPS 配置通过 BIOS 设置 CPUID 0x8000001E ECX[10:8] 字段传递给操作系统，
 内核在启动早期解析此信息：

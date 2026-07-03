@@ -8,6 +8,8 @@
 
 - [Q1: strace -c 显示 futex 调用最多说明什么？](#q1-strace--c-显示-futex-调用最多说明什么)
 - [Q2: strace 的性能开销有多大？生产环境能用吗？](#q2-strace-的性能开销有多大生产环境能用吗)
+- [Q3: strace 输出中 +++ exited with 0 +++ 是什么意思？](#q3-strace-输出中--exited-with-0--是什么意思)
+- [Q4: strace -p 附加到进程后没有输出，可能的原因？](#q4-strace--p-附加到进程后没有输出可能的原因)
 
 ---
 
@@ -186,6 +188,333 @@ perf trace -e read,write -p <PID>      # 追踪特定 syscall
 ```
 
 **一句话总结：** strace 基于 ptrace，每个 syscall 额外 ~20-30μs 开销，导致 10-100 倍减速。生产环境用 `perf trace`（开销 < 5%），开发环境用 `strace`（信息最全）。如果必须在生产用 strace，用 `-e trace=` 限定 syscall 类型 + `--seccomp` 减小开销。
+
+---
+
+## Q3: strace 输出中 +++ exited with 0 +++ 是什么意思？
+
+**日期：** 2026-07-04  
+**场景：** 用 strace 追踪进程，最后看到 `+++ exited with 0 +++`，不确定这是正常退出还是异常  
+**相关文件：** `docs/strace/reading/03_syscall_decode.md`  
+**源码位置：** strace `src/strace.c:3600-3613`、内核 `kernel/exit.c:873-920`
+
+### 回答
+
+**★ `+++ exited with N +++` 表示被追踪进程通过 `exit_group()` 系统调用正常退出，N 是退出状态码。**
+
+#### strace 源码：print_exited()
+
+```c
+// strace/src/strace.c:3599-3613
+static void
+print_exited(struct tcb *tcp, const int pid, int status)
+{
+    if (pid == strace_child) {
+        exit_code = WEXITSTATUS(status);   // ★ 提取退出状态码
+        strace_child = 0;
+    }
+
+    if (cflag != CFLAG_ONLY_STATS &&
+        !is_number_in_set(QUIET_EXIT, quiet_set)) {
+        printleader(tcp);
+        tprintf_string("+++ exited with %d +++", WEXITSTATUS(status));
+        //                    ^^^^^^^^^^^^^^^^
+        //                    ★ 用 WEXITSTATUS 宏从 wait 状态中提取退出码
+        tprint_newline();
+        line_ended();
+    }
+}
+```
+
+**关键点：**
+- `WEXITSTATUS(status)` 是 POSIX 标准宏，从 `waitpid()` 返回的状态值中提取 8 位退出码
+- 这行输出由 `TE_EXITED` 事件触发（见 `trace_event.h:56`）
+
+#### 退出状态码含义
+
+```
+退出码 │ 含义             │ 常见场景
+──────┼─────────────────┼────────────────────────────
+  0   │ ★ 成功退出       │ 程序正常完成
+  1   │ 通用错误         │ 脚本执行失败、参数错误
+  2   │ 误用 shell 命令  │ bash 内置命令用法错误
+ 126  │ 命令不可执行     │ 权限不足
+ 127  │ 命令未找到       │ command not found
+ 128+N│ 被信号 N 杀死    │ 128+9=137 → 被 SIGKILL 杀死
+ 255  │ 退出状态超出范围 │ exit status out of range
+```
+
+#### exit() vs exit_group()
+
+```c
+// kernel/exit.c:873-876 — exit() 只终止当前线程
+SYSCALL_DEFINE1(exit, int, error_code)
+{
+    do_exit((error_code&0xff)<<8);
+}
+
+// kernel/exit.c:915-920 — exit_group() 终止整个线程组
+SYSCALL_DEFINE1(exit_group, int, error_code)
+{
+    do_group_exit((error_code & 0xff) << 8);
+    // ★ 调用 do_group_exit() → zap_other_threads() → 杀死所有线程
+    /* NOTREACHED */
+    return 0;
+}
+```
+
+```
+exit() vs exit_group() 的区别：
+
+  exit(code):
+    只终止调用线程 → 其他线程继续运行
+    ★ 多线程程序中几乎不用
+
+  exit_group(code):
+    终止整个线程组（进程中的所有线程）
+    ★ glibc 的 exit() / _exit() 内部调用的是 exit_group
+    ★ strace 中绝大多数 +++ exited with +++ 来自 exit_group
+```
+
+```c
+// kernel/exit.c:882-907 — do_group_exit() 核心逻辑
+void do_group_exit(int exit_code)
+{
+    struct signal_struct *sig = current->signal;
+
+    if (signal_group_exit(sig))
+        exit_code = sig->group_exit_code;
+    else if (!thread_group_empty(current)) {
+        struct sighand_struct *const sighand = current->sighand;
+        spin_lock_irq(&sighand->siglock);
+        // ...
+        sig->group_exit_code = exit_code;
+        sig->flags = SIGNAL_GROUP_EXIT;
+        zap_other_threads(current);  // ★ 杀死同组其他线程
+        // ...
+        spin_unlock_irq(&sighand->siglock);
+    }
+    do_exit(exit_code);
+}
+```
+
+#### strace 中的其他退出方式
+
+```
++++ exited with 0 +++         ← exit_group(0) 正常退出
++++ killed by SIGKILL +++     ← 被 SIGKILL 信号杀死（strace.c:3591）
++++ killed by SIGSEGV (core dumped) +++  ← 段错误 + 核心转储
+--- stopped by SIGSTOP ---    ← 被信号暂停（不是退出）
+```
+
+```c
+// strace/src/strace.c:3590-3596 — 被信号杀死的输出
+tprintf_string("+++ killed by %s %s+++",
+               sprintsigname(WTERMSIG(status)),
+               WCOREDUMP(status) ? "(core dumped) " : "");
+```
+
+#### strace 注释中的真实示例
+
+```c
+// strace/src/strace.c:3796-3799 — strace 源码注释中的示例
+//  19923 clone(...) = 19924
+//  19923 exit_group(1)     = ?
+//  19923 +++ exited with 1 +++
+//                     ^^^^ 退出码为 1，表示异常退出
+```
+
+**一句话总结：** `+++ exited with N +++` 是 strace 报告进程通过 `exit_group()` 正常退出。`N=0` 表示成功，`N≠0` 表示异常。glibc 的 `exit()` 内部调用 `exit_group()`，会终止所有线程。如果被信号杀死，则显示 `+++ killed by SIGNAL +++`。
+
+---
+
+## Q4: strace -p 附加到进程后没有输出，可能的原因？
+
+**日期：** 2026-07-04  
+**场景：** `strace -p <PID>` 附加到运行中的进程，但没有任何系统调用输出  
+**相关文件：** `docs/strace/reading/01_ptrace_mechanism.md`  
+**源码位置：** 内核 `kernel/ptrace.c:357-459` — `ptrace_attach()`
+
+### 回答
+
+**★ 最常见的原因是进程处于 D 状态（不可中断睡眠），无法响应 ptrace 发出的 SIGSTOP 信号。其他原因包括进程空闲无系统调用、权限不足等。**
+
+#### ptrace attach 的内核流程
+
+```c
+// kernel/ptrace.c:357-459 — ptrace_attach() 核心逻辑
+static int ptrace_attach(struct task_struct *task, long request,
+                         unsigned long addr, unsigned long flags)
+{
+    // ...
+    // 1. 权限检查
+    retval = -EPERM;
+    if (unlikely(task->flags & PF_KTHREAD))  // ★ 不能 attach 内核线程
+        goto out;
+    if (same_thread_group(task, current))     // ★ 不能 attach 自己的线程组
+        goto out;
+
+    // 2. 设置 ptrace 标志
+    task->ptrace = flags;
+    ptrace_link(task, current);
+
+    // 3. ★ 关键：向目标进程发送 SIGSTOP
+    if (!seize)
+        send_sig_info(SIGSTOP, SEND_SIG_PRIV, task);
+    //              ^^^^^^^^
+    //              ★ PTRACE_ATTACH 必须发 SIGSTOP 让目标进程暂停
+
+    // 4. 如果目标已经处于 STOPPED 状态，唤醒它以转换到 TRACED
+    if (task_is_stopped(task) &&
+        task_set_jobctl_pending(task, JOBCTL_TRAP_STOP | JOBCTL_TRAPPING))
+        signal_wake_up_state(task, __TASK_STOPPED);
+
+    // 5. ★ 等待目标进程完成 STOPPED → TRACED 的转换
+    wait_on_bit(&task->jobctl, JOBCTL_TRAPPING_BIT, TASK_KILLABLE);
+    //          ^^^^^^^^^^^^^
+    //          ★ 如果目标进程在 D 状态，这里会一直等待！
+}
+```
+
+#### attach 流程时序图
+
+```
+strace (tracer)                        目标进程 (tracee)
+     │                                       │
+     │  ptrace(PTRACE_ATTACH, pid)           │
+     │───────────────────────────────────────│
+     │                                       │
+     │  ptrace_attach()                      │
+     │    │                                  │
+     │    ├─ 权限检查 ✓                      │
+     │    ├─ 设置 PT_PTRACED 标志            │
+     │    │                                  │
+     │    ├─ send_sig_info(SIGSTOP) ────────►│ 接收 SIGSTOP 信号
+     │    │                                  │    │
+     │    │                                  │    ├─ 如果状态 = S（可中断睡眠）
+     │    │                                  │    │   → 立即响应 → TASK_STOPPED
+     │    │                                  │    │   → ptrace 接管 → TASK_TRACED
+     │    │                                  │    │   → strace 开始工作 ✓
+     │    │                                  │    │
+     │    │                                  │    └─ 如果状态 = D（不可中断睡眠）
+     │    │                                  │        → ★ 无法响应信号！
+     │    │                                  │        → SIGSTOP 被排队等待
+     │    │                                  │        → ptrace_attach 阻塞在
+     │    │                                  │          wait_on_bit()
+     │    │                                  │        → strace 卡住！✗
+     │    │                                  │
+     │    └─ wait_on_bit(TRAPPING) ──等待──►│ ...一直等...
+     │                                       │
+```
+
+#### 原因分类与排查
+
+```
+原因                     │ 排查方法                          │ 解决方案
+────────────────────────┼──────────────────────────────────┼───────────────────────
+★ 进程在 D 状态         │ cat /proc/<PID>/status 看 State  │ 等 I/O 完成后自动恢复
+（不可中断睡眠）         │ 或 ps -p <PID> -o stat,wchan     │ 无法强制中断
+────────────────────────┼──────────────────────────────────┼───────────────────────
+进程空闲无 syscall       │ 等待或触发进程活动                 │ 正常现象
+                         │ strace -p <PID> -e trace=all     │
+────────────────────────┼──────────────────────────────────┼───────────────────────
+权限不足                 │ strace 会报 "Operation not       │ sudo strace -p <PID>
+                         │ permitted" 错误                  │
+────────────────────────┼──────────────────────────────────┼───────────────────────
+内核线程                 │ ps 显示 COMMAND 为 [kworker/0]   │ ★ 不能 ptrace 内核线程
+                         │ 方括号包裹 = 内核线程             │ 用 ftrace/perf 代替
+────────────────────────┼──────────────────────────────────┼───────────────────────
+已被其他 tracer attach   │ 一个进程同时只能被一个 tracer     │ 先 detach 其他 tracer
+                         │ ptrace（内核限制）               │
+```
+
+#### D 状态详解
+
+```
+D 状态（TASK_UNINTERRUPTIBLE）的进程：
+
+  ★ 不响应任何信号，包括 SIGSTOP 和 SIGKILL
+  ★ 通常在内核中等待 I/O 操作完成：
+    - 磁盘 I/O（submit_bio 后等待完成）
+    - NFS 服务器响应
+    - 文件系统锁（flock、fcntl）
+    - 互斥锁（mutex）等待
+
+  内核调度代码：
+    // kernel/sched/core.c:4462-4473
+    prev_state = prev->state;
+    if (!preempt && prev_state) {
+        if (signal_pending_state(prev_state, prev)) {
+            prev->state = TASK_RUNNING;
+        } else {
+            prev->sched_contributes_to_load =
+                (prev_state & TASK_UNINTERRUPTIBLE) &&  // ★ D 状态
+                !(prev_state & TASK_NOLOAD) &&
+                !(prev->flags & PF_FROZEN);
+            if (prev->sched_contributes_to_load)
+                rq->nr_uninterruptible++;  // ★ 计入 vmstat 的 b 列
+        }
+    }
+
+  ★ D 状态的进程会贡献给 vmstat 的 b（blocked）列和 ps 的 load average
+```
+
+#### PTRACE_SEIZE：不发送 SIGSTOP 的替代方案
+
+```c
+// kernel/ptrace.c:361-373 — PTRACE_SEIZE 不发送 SIGSTOP
+bool seize = (request == PTRACE_SEIZE);
+if (seize) {
+    // PTRACE_SEIZE: 不发送 SIGSTOP，目标进程继续运行
+    flags = PT_PTRACED | PT_SEIZED | (flags << PT_OPT_FLAG_SHIFT);
+} else {
+    // PTRACE_ATTACH: 发送 SIGSTOP 暂停目标进程
+    flags = PT_PTRACED;
+}
+
+// kernel/ptrace.c:411-413
+if (!seize)
+    send_sig_info(SIGSTOP, SEND_SIG_PRIV, task);
+    // ★ 只有 PTRACE_ATTACH 发 SIGSTOP，PTRACE_SEIZE 不发
+```
+
+```
+PTRACE_ATTACH vs PTRACE_SEIZE：
+
+  PTRACE_ATTACH（strace -p 默认使用）：
+    → 发送 SIGSTOP → 目标进程暂停 → 转换为 TRACED
+    → ★ 如果目标在 D 状态，attach 会阻塞
+
+  PTRACE_SEIZE（较新的接口）：
+    → 不发送 SIGSTOP → 目标进程继续运行
+    → ★ 不会因 D 状态而阻塞
+    → 但 strace 默认不用这个
+```
+
+#### 实用排查步骤
+
+```bash
+# 1. 检查目标进程状态
+cat /proc/<PID>/status | grep State
+# State: D (disk sleep)  → ★ D 状态，等 I/O
+# State: S (sleeping)    → 正常睡眠，应该能 attach
+# State: R (running)     → 运行中，应该能 attach
+
+# 2. 查看进程在等什么
+cat /proc/<PID>/wchan
+# io_schedule  → 等待 I/O（D 状态的常见原因）
+# futex_wait   → 等待锁（S 状态，可以 attach）
+
+# 3. 查看内核调用栈
+cat /proc/<PID>/stack
+# 看具体卡在哪个内核函数
+
+# 4. 如果确认是 D 状态
+# ★ 唯一方案：等 I/O 完成，或解决 I/O 问题（如修复 NFS）
+# 无法通过 kill 或任何信号中断 D 状态进程
+```
+
+**一句话总结：** `strace -p` 没有输出的最常见原因是目标进程处于 **D 状态**（不可中断睡眠），此时进程不响应 SIGSTOP 信号，ptrace attach 被阻塞在 `wait_on_bit()` 上。用 `cat /proc/<PID>/status | grep State` 确认状态，D 状态只能等 I/O 完成。其他原因包括进程空闲（无 syscall）、权限不足、目标是内核线程等。
 
 ---
 
