@@ -253,3 +253,206 @@ perf mem report --sort=mem
 - 8 核共享 32MB L3（CCD 内）→ 工作集 > 32MB 时 L3 miss 必然高
 - 跨 CCD 访问延迟翻倍（~100 vs ~35 周期）→ 用 `taskset` 绑定协作线程到同一 CCD
 - 检查 NPS 配置 → `numactl --hardware` 确认 NUMA 节点数
+
+---
+
+## Q5: Backend Bound 中 Memory Bound 和 Core Bound 如何区分？
+
+**日期：** 2026-07-04
+**场景：** Top-Down Level 1 分析显示 Backend Bound 占比很高，需要进一步定位是内存瓶颈还是执行单元瓶颈
+**相关文件：** `reading/05_high_cpu_low_throughput.md`、`reading/02_command_reference.md`
+
+### 回答
+
+**★ Memory Bound 和 Core Bound 的区分是 TMAM Level 2 的核心任务。** 两者使用不同的 PMU 事件来判断 — Memory Bound 通过内存子系统停顿事件（`CYCLE_ACTIVITY.STALLS_MEM_ANY`）直接测量，Core Bound 通过排除法（`Backend Bound - Memory Bound`）得到。
+
+#### TMAM Level 2 分类逻辑
+
+```
+                    All Pipeline Slots
+                    ┌───────────────────┐
+                    │                   │
+              ┌─────┴─────┐       ┌────┴─────┐
+              │ Retiring  │       │ Not      │
+              │ (有用的)   │       │ Retiring │
+              └───────────┘       └────┬─────┘
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    │                  │                  │
+              ┌─────┴──────┐  ┌───────┴──────┐  ┌───────┴──────┐
+              │ Frontend   │  │ Bad          │  │ Backend      │
+              │ Bound      │  │ Speculation  │  │ Bound        │
+              └────────────┘  └──────────────┘  └──────┬───────┘
+                                                       │
+                                        ┌──────────────┴──────────────┐
+                                        │                             │
+                                 ┌──────┴──────┐              ┌───────┴──────┐
+                                 │ Memory      │              │ Core         │
+                                 │ Bound       │              │ Bound        │
+                                 └─────────────┘              └──────────────┘
+                                     ★ Level 2 ★
+```
+
+#### ★ 核心 PMU 事件对照表
+
+| 分类 | PMU 事件 | 含义 | 源码位置 |
+|------|---------|------|---------|
+| **Memory Bound** | `CYCLE_ACTIVITY.STALLS_MEM_ANY` | 因内存子系统有 outstanding load 导致的执行停顿 | `skylake/pipeline.json:453` |
+| **Core Bound** | 无直接事件 | Backend Bound 减去 Memory Bound 的差值 | 计算公式 |
+| Backend Bound 总计 | `CYCLE_ACTIVITY.STALLS_TOTAL` | 所有类型的执行停顿 | `skylake/pipeline.json:403` |
+| 补充事件 | `EXE_ACTIVITY.EXE_BOUND_0PORTS` | 无端口可用的执行停顿（Core Bound 特征） | `skylake/pipeline.json:463` |
+
+**源码证据（Skylake 事件定义）：**
+
+```json
+// 源码：src/linux-5.10/tools/perf/pmu-events/arch/x86/skylake/pipeline.json:453
+{
+    "EventCode": "0xA3",
+    "UMask": "0x14",
+    "EventName": "CYCLE_ACTIVITY.STALLS_MEM_ANY",
+    "BriefDescription": "Execution stalls while memory subsystem
+                         has an outstanding load."
+}
+
+// 源码：src/linux-5.10/tools/perf/pmu-events/arch/x86/skylake/pipeline.json:403
+{
+    "EventCode": "0xA3",
+    "UMask": "0x04",
+    "EventName": "CYCLE_ACTIVITY.STALLS_TOTAL",
+    "BriefDescription": "Total execution stalls."
+}
+```
+
+#### ★ 计算公式
+
+```
+Level 2 Backend Bound 分解（来源：reading/02_command_reference.md 第 325-329 行）：
+
+Memory Bound = CYCLE_ACTIVITY.STALLS_MEM_ANY / CPU_CLK_UNHALTED.THREAD
+
+Core Bound   = Backend Bound - Memory Bound
+             = (CYCLE_ACTIVITY.STALLS_TOTAL - CYCLE_ACTIVITY.STALLS_MEM_ANY)
+               / CPU_CLK_UNHALTED.THREAD
+
+★ 关键理解：
+  - Memory Bound 是直接测量的（有专用 PMU 事件）
+  - Core Bound 是排除法得到的（总停顿 - 内存停顿 = 执行单元停顿）
+  - 这意味着 Core Bound 包含了"不在等待内存但也没在干活"的周期
+```
+
+#### Memory Bound vs Core Bound 的特征差异
+
+| 特征 | Memory Bound | Core Bound |
+|------|-------------|-----------|
+| **根本原因** | 等待数据从缓存/内存到达 | 执行单元忙或指令依赖链 |
+| **PMU 特征** | `STALLS_MEM_ANY` 高 | `STALLS_MEM_ANY` 低但 `STALLS_TOTAL` 高 |
+| **L3 miss 率** | ★ 高（> 30%） | 低（< 10%） |
+| **IPC** | 低 | 低 |
+| **典型场景** | 大数据集扫描、随机访问、cache 污染 | 除法运算、长依赖链、端口竞争 |
+| **优化方向** | 预取、数据局部性、大页 | 算法优化、减少依赖链 |
+
+（来源：reading/05_high_cpu_low_throughput.md 第 194-195 行）
+
+#### ★ 实战诊断流程
+
+**Step 1：Level 2 Top-Down 分析（Intel 平台）**
+
+```bash
+# 一步获取 Level 2 全部指标
+perf stat --topdown --td-level 2 -- ./program
+
+# 输出示例：
+# Topdown accuracy: 99.8%
+#   Retiring:           28.5%
+#   Bad Speculation:     2.5%
+#   Frontend Bound:      5.2%
+#   Backend Bound:      63.8%
+#     Memory Bound:     52.3%    ← ★ 占 Backend 的 82%
+#     Core Bound:       11.5%
+```
+
+**Step 2：用原始 PMU 事件验证**
+
+```bash
+# 采集 Memory Bound 和 Core Bound 相关事件
+perf stat -e \
+  CYCLE_ACTIVITY.STALLS_MEM_ANY,\
+  CYCLE_ACTIVITY.STALLS_TOTAL,\
+  CYCLE_ACTIVITY.CYCLES_MEM_ANY,\
+  EXE_ACTIVITY.EXE_BOUND_0PORTS,\
+  MEM_LOAD_RETIRED.L3_MISS,\
+  MEM_LOAD_RETIRED.L3_HIT \
+  -- ./program
+
+# 判断逻辑：
+# STALLS_MEM_ANY / STALLS_TOTAL > 70% → Memory Bound 为主
+# STALLS_MEM_ANY / STALLS_TOTAL < 30% → Core Bound 为主
+```
+
+**Step 3：AMD 平台的替代方法**
+
+```bash
+# AMD 没有 TMAM 的专用事件，用以下方式近似：
+
+# 方法 1：stalled-cycles + cache miss 推断
+perf stat -e \
+  stalled-cycles-backend,\
+  LLC-loads,LLC-load-misses,\
+  L1-dcache-loads,L1-dcache-load-misses \
+  -- ./program
+
+# 判断逻辑：
+# LLC miss 率高 + stalled-cycles-backend 高 → Memory Bound
+# LLC miss 率低 + stalled-cycles-backend 高 → Core Bound
+
+# 方法 2：perf stat -d（通用指标）
+perf stat -d -- ./program
+# IPC < 1 + cache-miss > 30% → Memory Bound
+# IPC < 1 + cache-miss < 10% → Core Bound
+```
+
+#### Level 3 进一步细分（Intel）
+
+```
+Memory Bound 细分（Level 3）：
+┌──────────────────────┬─────────────────────────────────────────┐
+│ L1 Bound             │ L1 缓存命中但调度器满                    │
+│ L2 Bound             │ L2 缓存未命中导致停顿                    │
+│ L3 Bound             │ L3 缓存未命中导致停顿                    │
+│ DRAM Bound           │ 主存访问导致长延迟停顿                   │
+│ Store Bound          │ Store Buffer 满                          │
+└──────────────────────┴─────────────────────────────────────────┘
+
+Core Bound 细分（Level 3）：
+┌──────────────────────┬─────────────────────────────────────────┐
+│ Divider              │ 除法单元繁忙                             │
+│ Port 0/1/5           │ 特定执行端口竞争                         │
+│ Port 2/3/4           │ 加载/存储端口竞争                        │
+└──────────────────────┴─────────────────────────────────────────┘
+
+（来源：reading/02_command_reference.md 第 167-192 行）
+```
+
+#### 三种典型场景对比
+
+```
+场景 A：大内存扫描（Memory Bound）
+  perf stat --topdown --td-level 2:
+    Memory Bound: 82%  ← ★ L3 miss 高，DRAM 访问多
+    Core Bound:    7%
+  优化：流式预取、数据压缩、减少工作集
+
+场景 B：密集浮点运算（Core Bound）
+  perf stat --topdown --td-level 2:
+    Memory Bound:  8%  ← ★ 数据在 L1 中，但计算单元忙
+    Core Bound:   65%
+  优化：SIMD 向量化、减少依赖链、循环展开
+
+场景 C：指针追踪/链表遍历（Memory Bound）
+  perf stat --topdown --td-level 2:
+    Memory Bound: 88%  ← ★ 随机访问导致 cache miss 级联
+    Core Bound:    5%
+  优化：数据结构改为数组、cache-friendly 布局
+```
+
+**一句话总结：** Memory Bound 通过 `CYCLE_ACTIVITY.STALLS_MEM_ANY` 直接测量（等数据的周期），Core Bound 通过排除法（`Backend Bound - Memory Bound`）得到（有数据但没活干的周期）。`perf stat --topdown --td-level 2` 一步获取两者的占比，L3 miss 率是辅助判断的关键指标。
