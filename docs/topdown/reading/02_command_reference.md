@@ -18,31 +18,6 @@
 
 ## 一、perf stat --topdown 参数详解
 
-###语法
-
-```bash
-# Step 2: perf stat --topdown 命令参考
-
-> 从 TMAM 的工具链：perf stat 参数、metric group、pmu-tools、事件组定义
-
----
-
-## 阅读要点
-
-1. `perf stat --topdown --td-level N` 参数详解
-2. `-M TopdownL1/L2/L3` metric group 方式
-3. toplev.py（pmu-tools）增强功能
-4. Level 1-4 每级的事件组定义
-5
-
-5. 10+ 个分析场景实用命令
-
-**预计阅读时间：** 20 分钟
-
----
-
-## 一、perf stat --topdown 参数详解
-
 ### 1.1 基本语法
 
 ```bash
@@ -59,7 +34,8 @@ perf stat --topdown --td-level <N> [选项] -- <命令>
 | `-M TopdownL2` | Metric group L2 | — | 等价于 --topdown --td-level 2 |
 | `--metric-only` | 仅显示计算后的指标 | 关闭 | 隐藏原始事件计数 |
 | `--metric-no-group` | 不组合事件组 | 关闭 | 减少 multiplexing |
-| `-j` / `--json-output` | JSON 输出 | 关闭 | 方便脚本解析| `-x,` | CSV 分隔符 | — | 导出到表格分析 |
+| `-j` / `--json-output` | JSON 输出 | 关闭 | 方便脚本解析 |
+| `-x,` | CSV 分隔符 | — | 导出到表格分析 |
 | `-I <ms>` | 间隔打印 | — | 每 N 毫秒输出一次 |
 | `-r <N>` | 重复运行 | 1 | 取平均值和标准差 |
 | `-C <cpu>` | 指定 CPU | 全部 | 绑定到特定 CPU |
@@ -94,19 +70,19 @@ perf stat --topdown --td-level <N> [选项] -- <命令>
 └─────────────────────────────────────────────────┘
 ```
 
-### 1.4 td-level 取值含义bash
-# 方式 1：四大 1 —
+### 1.4 常用命令示例
+
+```bash
+# 方式 1：Level 1 四大类分析
 perf stat --topdown --td-level 1 -- ./program
 
-# 方式 2：metric group（兼容方式更好）
+# 方式 2：metric group（兼容性更好）
 perf stat -M TopdownL1 -- ./program
 
-# 附加 Level 2
-perf stat --td-level 2 -- ./program
+# 方式 3：Level 2 八大子类分析
+perf stat --topdown --td-level 2 -- ./program
 
-# 方式 3：仅显示 metric事件和 --topdown --td-level 2
-
-# 方式 3：仅显示指标值
+# 方式 4：仅显示指标值（隐藏原始事件计数）
 perf stat --topdown --td-level 1 --metric-only -- ./program
 
 # 方式 4：JSON 输出（便于脚本解析）
@@ -278,8 +254,7 @@ toplev.py [选项] -- <命令>
 | 参数 | 含义 | 默认值 | 说明 |
 |------|------|--------|------|
 | `-l <N>` | 分析层级 | 1 | 1-6 级 |
-| `--core <C>` | 指定 CPU 核心 | 全部 | 格式C0`、`C0` |
-| `C0`  0` |
+| `--core <C>` | 指定 CPU 核心 | 全部 | 格式：`C0`、`C0-C3` |
 | `--no-desc` | 不显示指标描述 | 显示 | 减少输出 |
 | `--graph` | 生成 ASCII 图表 | 关闭 | 树状展示 |
 | `--nodes <nodes>` | 仅显示指定节点 | 全部 | 如 `+Frontend_Bound` |
@@ -424,18 +399,19 @@ perf stat --topdown --td-level 2 -- ./program_optimized 2>&1 | tee after.txt
 
 ### 场景 4：附加到已运行进程
 
-```长
+```bash
+# 附加到 PID，采集 30 秒 topdown 数据
+perf stat --topdown --td-level 1 -p <PID> sleep 30
+```
+
+### 场景 5：同时收集补充事件
 
 ```bash
-# 找到 30 秒
- topdown 数据
-perf stat --topdown --td-level 1 -e cycles,instructions,cache-misses,branch-misses -- ./program
+# topdown + 缓存和分支事件
+perf stat --topdown --td-level 1 -e cache-misses,branch-misses,L1-dcache-load-misses -- ./program
+```
 
-# ★ 同时收集 topdown 分布硬件事件
-# 场景补充全面的性能分析
-perf stat -level 1 -e cache-misses,branch-misses,L1-dcache-load-misses -- ./program
-
-# 场景 6：多核对比
+### 场景 6：多核对比
 
 ```bash
 # 分别在每个核心上运行
@@ -448,11 +424,11 @@ wait
 ### 场景 7：时间序列分析
 
 ```bash
-# 每输出一次 topdown
+# 每 1000ms 输出一次 topdown
 perf stat --topdown --td-level 1 -I 1000 -- ./long_running_program
 
-# ★ 可以是否随时间变化（如启动时 vs 稳 不同后  Backend Bound 为主
-``````
+# ★ 可以观察性能随时间变化（如启动时 Frontend Bound 为主，稳态后 Backend Bound 为主）
+```
 
 ### 场景 8：生成 toplev.py 树状图
 
@@ -510,11 +486,13 @@ for prog in $PROGRAMS; do
   result=$(perf stat --topdown --td-level 1 -x, -- ./$prog 2>&1 | grep -E "^tma_")
   echo "$prog,$result"
 done
+```
 
-### 场景 12：系统级 --json-output 输出
-```down --td-level 1 -j -- ./program 2>&1 | python3 -m json.tool
-#
-# ★ 输出便于脚本自动化分析
+### 场景 12：JSON 输出
+
+```bash
+# JSON 格式输出，便于脚本自动化分析
+perf stat --topdown --td-level 1 -j -- ./program 2>&1 | python3 -m json.tool
 ```
 
 ### 场景 13：使用 toplev.py 的 --drilldown 模式
@@ -528,6 +506,7 @@ toplev.py --core C0 --drilldown -- ./program
 #   2. 找到最大瓶颈项
 #   3. 继续下钻到更深层级
 #   4. 直到找到根本原因
+```
 
 ### 场景 14：NUMA 感知的 topdown 分析
 
@@ -536,9 +515,11 @@ toplev.py --core C0 --drilldown -- ./program
 perf stat --topdown --td-level 1 -C 0-3 -- numactl --cpunodebind=0 -- ./program
 perf stat --topdown --td-level 1 -C 4-7 -- numactl --cpunodebind=1 -- ./program
 
-# ★ 对比两个 NUMA 节点的 topdown 分布  远端内存 NUM NUMA 不平衡
+# ★ 对比两个 NUMA 节点的 topdown 分布
+#   远端内存访问会导致 Memory Bound 升高，NUMA 不平衡
+```
 
-### 场景 15：结合线程对比
+### 场景 15：SMT 线程对比
 
 ```bash
 # 单线程模式
@@ -548,7 +529,7 @@ taskset -c 0 perf stat --topdown --td-level 1 -- ./program
 taskset -c 0,1 perf stat --topdown --td-level 1 -- ./program_mt
 
 # ★ 对比 SMT 开/关时的 topdown 差异
-  SMT 开启时 Backend Bound 通常更低（两个线程互补）
+#   SMT 开启时 Backend Bound 通常更低（两个线程互补填充空闲 Slot）
 ```
 
 ---
