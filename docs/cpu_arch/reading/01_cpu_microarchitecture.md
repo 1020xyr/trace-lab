@@ -962,8 +962,9 @@ do {                                          \
 #define barrier_nospec() alternative("", "lfence", X86_FEATURE_LFENCE_RDTSC)
 ```
 
+### 6.3 Store Buffer 与内存序问题
+
 ```
-  ★ 经典的 Store Buffer 问题:
 
   初始状态: x = 0, y = 0
 

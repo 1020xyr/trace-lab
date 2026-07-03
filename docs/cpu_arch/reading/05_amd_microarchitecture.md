@@ -565,7 +565,7 @@ void cacheinfo_amd_init_llc_id(struct cpuinfo_x86 *c,
     → 大部分数据驻留 L3 → 低 miss 率
 ```
 
-### 3.3 AMD L3 Cache Partitioning（L3 Way Partitioning）
+### 3.4 AMD L3 Cache Partitioning（L3 Way Partitioning）
 
 AMD EPYC 支持通过 **Platform QoS (PQoS)** 对 L3 进行分区：
 

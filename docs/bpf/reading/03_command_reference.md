@@ -474,7 +474,7 @@ bpftool map show
 # 按 ID 查看 Map 详情
 bpftool map show id 15
 
-# 导出 Map 的所有键值对
+# ★ 导出 Map 的所有键值对
 bpftool map dump id 15
 
 # 查找特定 key
@@ -512,7 +512,7 @@ bpftool link show id 5
 # 列出所有 BTF 对象
 bpftool btf list
 
-# 导出内核 BTF（所有内核类型定义）
+# ★ 导出内核 BTF（所有内核类型定义）
 bpftool btf dump file /sys/kernel/btf/vmlinux | head -50
 
 # 导出为 C 头文件格式（★ 查看内核结构体定义）
@@ -552,7 +552,7 @@ bpftool net show dev eth0
 ### 5.8 gen — 代码生成
 
 ```bash
-# 生成 BPF skeleton 头文件（★ CO-RE 开发必备）
+# ★ 生成 BPF skeleton 头文件（★ CO-RE 开发必备）
 bpftool gen skeleton prog.bpf.o name my_prog > my_prog.skel.h
 
 # 生成 vmlinux.h（从内核 BTF 生成头文件）
