@@ -98,7 +98,68 @@ $ cat /proc/1/stat
 | 39 | processor | CPU 列（最后运行在哪个 CPU） |
 | 42 | guest_time | %guest（虚拟机客户时间） |
 
-**时间单位：** clock_t（通常 100Hz，即 1 clock_t = 10ms）。可通过 `getconf CLK_TCK` 验证。
+**进程状态字符映射（内核源码）**
+
+```c
+/* 源码位置：src/linux-5.10/include/linux/sched.h:79-112 */
+/* ★ 进程状态常量定义 —— 对应 /proc/[pid]/stat 字段 3 的状态字符 */
+#define TASK_RUNNING            0x0000   // → 'R' 可运行/正在运行
+#define TASK_INTERRUPTIBLE      0x0001   // → 'S' 可中断睡眠（等待事件/信号）
+#define TASK_UNINTERRUPTIBLE    0x0002   // → 'D' 不可中断睡眠（通常等待 I/O）
+#define __TASK_STOPPED          0x0004   // → 'T' 停止（收到 SIGSTOP）
+#define __TASK_TRACED           0x0008   // → 't' 被调试器跟踪停止
+#define EXIT_DEAD               0x0010   // → 'X' 已退出（最终状态）
+#define EXIT_ZOMBIE             0x0020   // → 'Z' 僵尸进程（父进程未回收）
+#define TASK_PARKED             0x0040   // → 'P' 停放（内核线程专用）
+#define TASK_DEAD               0x0080   // → 'X' 死亡
+#define TASK_IDLE   (TASK_UNINTERRUPTIBLE | TASK_NOLOAD) // → 'I' 空闲（不计入负载）
+
+/* 便捷组合宏 */
+#define TASK_KILLABLE  (TASK_WAKEKILL | TASK_UNINTERRUPTIBLE) // 可被致命信号唤醒的 D 状态
+#define TASK_STOPPED   (TASK_WAKEKILL | __TASK_STOPPED)
+#define TASK_TRACED    (TASK_WAKEKILL | __TASK_TRACED)
+```
+
+```c
+/* 源码位置：src/linux-5.10/fs/proc/array.c:129-149 */
+/* ★ 状态字符数组 —— task_state_index() 返回索引，查表得到状态字符串 */
+static const char * const task_state_array[] = {
+    "R (running)",       /* 0x00 */
+    "S (sleeping)",      /* 0x01 */
+    "D (disk sleep)",    /* 0x02 */
+    "T (stopped)",       /* 0x04 */
+    "t (tracing stop)",  /* 0x08 */
+    "X (dead)",          /* 0x10 */
+    "Z (zombie)",        /* 0x20 */
+    "P (parked)",        /* 0x40 */
+    "I (idle)",          /* 0x80 */
+};
+
+static inline const char *get_task_state(struct task_struct *tsk)
+{
+    BUILD_BUG_ON(1 + ilog2(TASK_REPORT_MAX) != ARRAY_SIZE(task_state_array));
+    return task_state_array[task_state_index(tsk)];
+    /* ★ task_state_index() 用 fls() 找到 state 中最高置位 bit，
+     *    作为数组索引。例如 state=0x0001 → fls(1)=1 → "S (sleeping)" */
+}
+```
+
+```c
+/* 源码位置：src/linux-5.10/include/linux/sched.h:1476-1490 */
+/* ★ 状态索引计算：将 task->state 映射到 task_state_array 下标 */
+static inline unsigned int task_state_index(struct task_struct *tsk)
+{
+    unsigned int tsk_state = READ_ONCE(tsk->state);
+    unsigned int state = (tsk_state | tsk->exit_state) & TASK_REPORT;
+
+    BUILD_BUG_ON_NOT_POWER_OF_2(TASK_REPORT_MAX);
+
+    if (tsk_state == TASK_IDLE)
+        state = TASK_REPORT_IDLE;     // ★ TASK_IDLE 特殊处理，映射到 'I'
+
+    return fls(state);   // ★ fls = find last set，返回最高位位置作为数组索引
+}
+```
 
 **%CPU 计算公式：**
 ```

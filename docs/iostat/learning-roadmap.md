@@ -611,11 +611,13 @@ sar 定时采集配置：
 
 ---
 
-## 7. 与其他工具的协作
+## 7. ★ 与其他工具的协作 — 完整诊断链路
 
-### iostat + blktrace 联合诊断流程
+### ★ iostat + blktrace 联合诊断流程（黄金组合）
 
 ```
+★ 这是 I/O 性能诊断最经典的组合
+
 1. iostat -x 1 → 发现异常指标
    │
    ├── %util 持续 100%    → 设备饱和
@@ -630,8 +632,26 @@ sar 定时采集配置：
 3. blkparse → 看每个 I/O 的 Q/D/C 事件
    btt → 看 Q2D/D2C 延迟分布
    │
-   ├── Q2D 高 → 软件层瓶颈（调度器、队列）
+   ├── Q2D 高 → 软件层瓶颈（调度器、队列深度）
+   │   └── 优化方向：调整 I/O 调度器、增加队列深度
    └── D2C 高 → 硬件层瓶颈（设备性能）
+       └── 优化方向：升级存储设备、检查设备健康
+```
+
+### ★ iostat + pidstat — 从设备到进程
+
+```
+1. iostat -x 1 → 发现设备级 I/O 异常
+2. pidstat -d 1 → 找到 kB_wr/s 或 kB_rd/s 最高的进程
+3. 验证：pidstat 所有进程的 I/O 总和 ≈ iostat 的设备级 I/O
+```
+
+### ★ iostat + fio — 压测验证
+
+```
+1. iostat 观察生产环境的 I/O 模式（r/s、w/s、bs 大小）
+2. fio 复现类似 I/O 模式 → 在可控条件下验证问题
+3. fio 输出 slat/clat/lat → 与 iostat 的 await 对照验证
 ```
 
 ### iostat + sar 长期监控
