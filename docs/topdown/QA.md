@@ -4,6 +4,16 @@
 
 ---
 
+## 目录
+
+- [Q1: 为什么 perf stat --topdown 在虚拟机上无法使用？](#q1-为什么-perf-stat---topdown-在虚拟机上无法使用)
+- [Q2: TMAM 的 Pipeline Width（流水线宽度）为什么因 CPU 代际不同？](#q2-tmam-的-pipeline-width流水线宽度为什么因-cpu-代际不同)
+- [Q3: AMD 没有 Top-Down PMU 事件怎么办？](#q3-amd-没有-top-down-pmu-事件怎么办)
+- [Q4: CPU 高占用低吞吐如何用 Top-Down 方法诊断？](#q4-cpu-高占用低吞吐如何用-top-down-方法诊断)
+- [Q5: Backend Bound 中 Memory Bound 和 Core Bound 如何区分？](#q5-backend-bound-中-memory-bound-和-core-bound-如何区分)
+
+---
+
 <!-- 格式说明：
 ## Q{N}: {问题标题}
 

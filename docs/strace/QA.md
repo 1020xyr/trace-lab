@@ -376,34 +376,33 @@ static int ptrace_attach(struct task_struct *task, long request,
 }
 ```
 
-#### attach 流程时序图
+#### attach 流程时序图（现代 strace 使用 SEIZE + INTERRUPT）
 
 ```
 strace (tracer)                        目标进程 (tracee)
      │                                       │
-     │  ptrace(PTRACE_ATTACH, pid)           │
+     │  1. ptrace(PTRACE_SEIZE, pid)         │
      │───────────────────────────────────────│
+     │  → 设置 PT_PTRACED | PT_SEIZED        │
+     │  → ★ 不发 SIGSTOP，目标继续运行       │
      │                                       │
-     │  ptrace_attach()                      │
+     │  2. ptrace(PTRACE_INTERRUPT, pid)     │
+     │───────────────────────────────────────│
+     │  → 请求中断目标进程                    │
+     │                                       │
+     │    ├─ 如果状态 = S（可中断睡眠）       │
+     │    │   → 目标在下一个检查点暂停        │
+     │    │   → TASK_TRACED                  │
+     │    │   → strace 开始工作 ✓             │
      │    │                                  │
-     │    ├─ 权限检查 ✓                      │
-     │    ├─ 设置 PT_PTRACED 标志            │
-     │    │                                  │
-     │    ├─ send_sig_info(SIGSTOP) ────────►│ 接收 SIGSTOP 信号
-     │    │                                  │    │
-     │    │                                  │    ├─ 如果状态 = S（可中断睡眠）
-     │    │                                  │    │   → 立即响应 → TASK_STOPPED
-     │    │                                  │    │   → ptrace 接管 → TASK_TRACED
-     │    │                                  │    │   → strace 开始工作 ✓
-     │    │                                  │    │
-     │    │                                  │    └─ 如果状态 = D（不可中断睡眠）
-     │    │                                  │        → ★ 无法响应信号！
-     │    │                                  │        → SIGSTOP 被排队等待
-     │    │                                  │        → ptrace_attach 阻塞在
-     │    │                                  │          wait_on_bit()
-     │    │                                  │        → strace 卡住！✗
-     │    │                                  │
-     │    └─ wait_on_bit(TRAPPING) ──等待──►│ ...一直等...
+     │    └─ 如果状态 = D（不可中断睡眠）     │
+     │        → ★ 无法到达检查点！            │
+     │        → INTERRUPT 等待目标退出 D 状态 │
+     │        → strace 卡住 ✗                │
+     │                                       │
+     │  3. waitpid(pid) ◄────────────────────│ 暂停事件
+     │  4. ptrace(SETOPTIONS)                │
+     │  5. ptrace(SYSCALL) ─────────────────►│ 恢复执行
      │                                       │
 ```
 
@@ -459,16 +458,31 @@ D 状态（TASK_UNINTERRUPTIBLE）的进程：
   ★ D 状态的进程会贡献给 vmstat 的 b（blocked）列和 ps 的 load average
 ```
 
-#### PTRACE_SEIZE：不发送 SIGSTOP 的替代方案
+#### PTRACE_SEIZE：现代 strace 的默认行为
 
 ```c
+// strace/src/strace.c:575-587 — strace 优先使用 SEIZE
+static int
+ptrace_attach_or_seize(int pid, const char **ptrace_attach_cmd)
+{
+    int r;
+    if (!use_seize)
+        return *ptrace_attach_cmd = "PTRACE_ATTACH",
+               ptrace(PTRACE_ATTACH, pid, 0L, 0L);
+    // ★ 优先尝试 PTRACE_SEIZE（不发 SIGSTOP）
+    r = ptrace(PTRACE_SEIZE, pid, 0L, (unsigned long) ptrace_setoptions);
+    if (r)
+        return *ptrace_attach_cmd = "PTRACE_SEIZE", r;
+    // ★ SEIZE 成功后，用 PTRACE_INTERRUPT 请求中断（比 SIGSTOP 更温和）
+    r = ptrace(PTRACE_INTERRUPT, pid, 0L, 0L);
+    return *ptrace_attach_cmd = "PTRACE_INTERRUPT", r;
+}
+
 // kernel/ptrace.c:361-373 — PTRACE_SEIZE 不发送 SIGSTOP
 bool seize = (request == PTRACE_SEIZE);
 if (seize) {
-    // PTRACE_SEIZE: 不发送 SIGSTOP，目标进程继续运行
     flags = PT_PTRACED | PT_SEIZED | (flags << PT_OPT_FLAG_SHIFT);
 } else {
-    // PTRACE_ATTACH: 发送 SIGSTOP 暂停目标进程
     flags = PT_PTRACED;
 }
 
@@ -481,14 +495,15 @@ if (!seize)
 ```
 PTRACE_ATTACH vs PTRACE_SEIZE：
 
-  PTRACE_ATTACH（strace -p 默认使用）：
+  PTRACE_ATTACH（旧接口）：
     → 发送 SIGSTOP → 目标进程暂停 → 转换为 TRACED
     → ★ 如果目标在 D 状态，attach 会阻塞
 
-  PTRACE_SEIZE（较新的接口）：
-    → 不发送 SIGSTOP → 目标进程继续运行
-    → ★ 不会因 D 状态而阻塞
-    → 但 strace 默认不用这个
+  PTRACE_SEIZE + PTRACE_INTERRUPT（★ 现代 strace 默认使用）：
+    → SEIZE 不发送 SIGSTOP，目标进程继续运行
+    → INTERRUPT 请求中断，但不依赖信号机制
+    → ★ 对 D 状态进程的影响更小
+    → 但如果目标一直在 D 状态，INTERRUPT 也无法使其暂停
 ```
 
 #### 实用排查步骤

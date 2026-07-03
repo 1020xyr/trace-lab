@@ -149,4 +149,151 @@ perf stat -e cycles,instructions,cache-misses,cpu-migrations \
 
 ---
 
+## Q3: nginx 的 worker_processes 设多少合适？和 CPU 核数的关系？
+
+**日期：** 2026-07-04
+**场景：** 配置 nginx 时不确定 worker_processes 应该设为 auto 还是手动指定，以及在多核/超线程/CCD 架构下的最优设置
+**相关文件：** `docs/nginx/reading/04_performance_tuning.md`、`docs/nginx/reading/02_command_reference.md`
+
+### 回答
+
+**★ 核心结论：`worker_processes auto` = CPU 逻辑核数，但最优值不一定是核数。小核数机器用 auto 即可，大核数服务器（>16 核）应手动设为物理核数或 CCD 数量。**
+
+#### worker_processes auto 的实现机制
+
+```c
+/*
+ * 源码位置：src/os/unix/ngx_cpuinfo.c — ngx_ncpu
+ *          src/core/ngx_cycle.c — ngx_init_cycle()
+ *
+ * 检测逻辑：通过 sysconf(_SC_NPROCESSORS_ONLN) 获取在线 CPU 核数
+ */
+
+// 伪代码（reading/04_performance_tuning.md）
+if (ccf->worker_processes == NGX_CONF_UNSET) {
+    ccf->worker_processes = ngx_ncpu;  // ★ auto = CPU 逻辑核数
+}
+```
+
+`sysconf(_SC_NPROCESSORS_ONLN)` 返回的是**逻辑核数**（含超线程），不是物理核数。
+
+#### ★ 不同场景的最优设置
+
+| 场景 | CPU 配置 | `auto` 值 | 推荐设置 | 原因 |
+|------|---------|----------|---------|------|
+| 小服务器 | 4 核无超线程 | 4 | `auto`（= 4） | ★ 1 核 1 worker 最优 |
+| 中服务器 | 8 核有超线程（16 线程） | 16 | `8`（物理核数） | 超线程对 nginx 无益 |
+| 大服务器 | 64 核 EPYC（8 CCD） | 64 | `8`（CCD 数量） | ★ 减少 accept 竞争 |
+| 容器 | 限制 2 核 | 2 | `auto`（= 2） | cgroup 感知的核数 |
+
+#### 超线程对 nginx 的影响
+
+```
+物理 4 核（有超线程 = 8 逻辑核）：
+┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+│ C0/C0' │ │ C1/C1' │ │ C2/C2' │ │ C3/C3' │
+└────────┘ └────────┘ └────────┘ └────────┘
+
+worker_processes auto = 8（★ 含超线程，不是最优）
+
+原因：
+  nginx worker 是 CPU 密集型（事件循环 + 请求处理）
+  两个 worker 共享同一物理核的 L1/L2 缓存 → cache thrashing
+  两个 worker 竞争同一物理核的执行单元 → 性能下降
+
+  → 建议：worker_processes = 物理核数（非逻辑核数）
+```
+
+（来源：reading/04_performance_tuning.md 第 55-65 行）
+
+#### 大核数服务器为什么不用 auto
+
+```
+AMD EPYC 64 核（8 CCD，每 CCD 8 核共享 32MB L3）：
+
+方案 A: worker_processes auto（64 worker）
+  ┌─ 64 个 worker 竞争 accept()  → accept 风暴
+  ├─ 每个 worker 在不同 CCD 间迁移 → L3 cache miss
+  ├─ worker 间锁竞争加剧
+  └─ QPS: ~80,000
+
+方案 B: worker_processes = CCD 数量（8 worker）+ 绑核
+  ┌─ 8 个 worker，accept 竞争降低 8 倍
+  ├─ 每个 worker 独占一个 CCD 的 L3 缓存
+  ├─ worker 在 CCD 内迁移（共享 L3），cache miss 低
+  └─ QPS: ~110,000（★ 提升 37%）
+```
+
+（来源：reading/04_performance_tuning.md 第 193-235 行，Q1 也详细讨论了此问题）
+
+#### ★ 实战配置决策流程
+
+```
+查看 CPU 拓扑：
+  lscpu | grep -E '^CPU\(s\)|Thread|Core|Socket|NUMA'
+
+                    │
+                    ▼
+        CPU 逻辑核数 ≤ 8？
+        ├── 是 → worker_processes auto;    ★ 直接用 auto
+        │
+        └── 否 → 有超线程？
+                 ├── 是 → worker_processes = 物理核数;
+                 │         （= 逻辑核数 / 2）
+                 │
+                 └── 否 → 核数 > 16？
+                          ├── 是 → worker_processes = CCD 数量;
+                          │         + worker_cpu_affinity 绑核
+                          │
+                          └── 否 → worker_processes auto;
+```
+
+#### 常用配置模板
+
+```nginx
+# 小服务器（≤ 8 核）
+worker_processes auto;
+
+# 中等服务器（8-16 核，有超线程）
+worker_processes 8;    # = 物理核数
+worker_cpu_affinity auto;
+
+# 大服务器（AMD EPYC 64 核，8 CCD）
+worker_processes 8;    # = CCD 数量
+worker_cpu_affinity 0000000000000000000000000000000000000000000000000000000011111111 \
+                    0000000000000000000000000000000000000000000000001111111100000000 \
+                    ...;  # 每个 worker 绑定到一个 CCD
+
+# 容器环境
+worker_processes auto;  # sysconf 会感知到 cgroup 限制
+```
+
+#### 验证命令
+
+```bash
+# 查看 CPU 拓扑
+lscpu | grep -E 'Thread|Core|Socket|NUMA|CPU\(s\)'
+
+# 查看 CCD 拓扑（AMD）
+cat /sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list
+
+# 查看当前 nginx worker 数
+ps aux | grep "nginx: worker" | wc -l
+
+# 查看 worker CPU 分布
+top -bn1 | grep nginx
+
+# 性能测试：对比不同 worker 数的 QPS
+for n in 4 8 16 32 auto; do
+    sed -i "s/worker_processes .*/worker_processes $n;/" /etc/nginx/nginx.conf
+    nginx -s reload
+    sleep 2
+    wrk -t4 -c1000 -d10s http://localhost/ | grep Requests
+done
+```
+
+**一句话总结：** `worker_processes auto` 等于逻辑核数（含超线程）。小机器（≤8 核）直接用 auto 即可；大机器应手动设置 — 有超线程则用物理核数，AMD EPYC 等多 CCD 架构用 CCD 数量 + 绑核，可提升 QPS 30-40%。
+
+---
+
 *新的问题将追加到此文件。每个问题记录日期、场景、源码位置。*
