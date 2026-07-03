@@ -529,23 +529,23 @@ cancelled_write_bytes: 0
 ```
 
 ```
-时间        UID      PID   kB_rd/s   kB_wr/s kB_ccwr/s iodelay  Command
-...
-平均:       0     12345     0.00  10240.00     0.00     0       dd
+Linux 6.6.102-5.3.1.alnx4.x86_64 	07/04/2026 	_x86_64_	(4 CPU)
+
+12:53:07 AM   UID       PID   kB_rd/s   kB_wr/s kB_ccwr/s iodelay  Command
+Average:        0     12345     0.00      0.00      0.00       0  dd
 ```
 
 **对照分析：**
 
 ```
-dd 写入 10MB = 10240 KB
-pidstat kB_wr/s = 10240.00 (在 1 秒内完成)
+dd 写入 500MB，但 write_bytes = 0 → kB_wr/s = 0.00
 
-对应的 /proc/[pid]/io 变化：
-  write_bytes 增加了约 10 × 1024 × 1024 = 10485760 字节
-  kB_wr/s = 10485760 / 1 / 1024 = 10240 KB/s  ✓
+★ 原因：dd 写入的数据全部进入了 page cache（内存缓冲区）
+  还没有被内核的 flush 线程刷到磁盘
+  wchar = 205520896（约 196MB）→ 系统调用的写入量
+  write_bytes = 0              → 实际磁盘写入量
 
-★ 注意：wchar 增加量 ≥ write_bytes
-  因为 wchar 包含 page cache 缓冲，write_bytes 是实际落盘量
+★ 重要陷阱：pidstat -d 只看到实际磁盘 I/O，看不到 page cache 写入
 ```
 
 ### 实验 4：上下文切换统计（pidstat -w）
@@ -555,17 +555,18 @@ $ pidstat -w -p 1 1 1
 ```
 
 ```
-时间        UID      PID   cswch/s  nvcswch/s  Command
-...
-平均:       0        1       2.00      0.00     systemd
+Linux 6.6.102-5.3.1.alnx4.x86_64 	07/04/2026 	_x86_64_	(4 CPU)
+
+12:53:08 AM   UID       PID   cswch/s  nvcswch/s  Command
+Average:        0         1      0.00      0.00     systemd
 ```
 
 **对照分析：**
 
 ```
 /proc/1/status 显示：
-  voluntary_ctxt_switches:    158274
-  nonvoluntary_ctxt_switches: 184018
+  voluntary_ctxt_switches:    25709
+  nonvoluntary_ctxt_switches: 5595
 
 pidstat cswch/s = 2.00
   → 1 秒内 voluntary 增加了 2 次

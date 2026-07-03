@@ -98,6 +98,8 @@ $ cat /proc/1/stat
 | 39 | processor | CPU 列（最后运行在哪个 CPU） |
 | 42 | guest_time | %guest（虚拟机客户时间） |
 
+**时间单位：** clock_t（通常 100Hz，即 1 clock_t = 10ms）。可通过 `getconf CLK_TCK` 验证。
+
 **进程状态字符映射（内核源码）**
 
 ```c
@@ -311,6 +313,77 @@ kB_rd/s = (read_bytes_new - read_bytes_old) / interval / 1024
 ```
 
 **iodelay 来源：** 来自 `/proc/[pid]/schedstat` 或 `/proc/[pid]/sched` 中的 I/O 等待时间累积。
+
+**内核源码：`do_io_accounting()` 输出逻辑**
+
+```c
+/* 源码位置：src/linux-5.10/fs/proc/base.c:2927-2970 */
+/* ★ /proc/[pid]/io 文件的核心输出函数 */
+static int do_io_accounting(struct task_struct *task, struct seq_file *m, int whole)
+{
+    struct task_io_accounting acct = task->ioac;  // ★ 拷贝当前线程的 I/O 统计
+    unsigned long flags;
+    int result;
+
+    result = mutex_lock_killable(&task->signal->exec_update_mutex);
+    if (result)
+        return result;
+
+    if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)) {
+        result = -EACCES;   // ★ 权限检查：需要 ptrace 权限才能读取
+        goto out_unlock;
+    }
+
+    if (whole && lock_task_sighand(task, &flags)) {
+        struct task_struct *t = task;
+        /* ★ whole=1：聚合进程组所有线程的 ioac */
+        task_io_accounting_add(&acct, &task->signal->ioac);
+        while_each_thread(task, t)
+            task_io_accounting_add(&acct, &t->ioac);
+        unlock_task_sighand(task, &flags);
+    }
+
+    /* ★ 输出 7 个字段 */
+    seq_printf(m,
+           "rchar: %llu\n"
+           "wchar: %llu\n"
+           "syscr: %llu\n"
+           "syscw: %llu\n"
+           "read_bytes: %llu\n"          // ★ 实际从磁盘读取
+           "write_bytes: %llu\n"         // ★ 实际写入磁盘
+           "cancelled_write_bytes: %llu\n",
+           (unsigned long long)acct.rchar,
+           (unsigned long long)acct.wchar,
+           (unsigned long long)acct.syscr,
+           (unsigned long long)acct.syscw,
+           (unsigned long long)acct.read_bytes,
+           (unsigned long long)acct.write_bytes,
+           (unsigned long long)acct.cancelled_write_bytes);
+    // ...
+}
+```
+
+```c
+/* 源码位置：src/linux-5.10/include/linux/task_io_accounting.h:12-46 */
+/* ★ task_io_accounting 结构体 —— 嵌入在 task_struct.ioac 中 */
+struct task_io_accounting {
+#ifdef CONFIG_TASK_XACCT
+    u64 rchar;                  // 读字符数（含 page cache 命中）
+    u64 wchar;                  // 写字符数（含 page cache 缓冲）
+    u64 syscr;                  // read() 系统调用次数
+    u64 syscw;                  // write() 系统调用次数
+#endif
+#ifdef CONFIG_TASK_IO_ACCOUNTING
+    u64 read_bytes;             // ★ 实际从存储设备读取的字节数
+    u64 write_bytes;            // ★ 实际写入存储设备的字节数
+    u64 cancelled_write_bytes;  // ★ 因 truncate 等原因取消的写入字节数
+#endif
+};
+```
+
+> **源码验证：** `rchar`/`wchar` 统计的是 read/write **系统调用**的字节数（含 page cache），
+> 而 `read_bytes`/`write_bytes` 统计的是**实际到达/离开磁盘**的字节数。
+> 这就是为什么 pidstat 的 kB_rd/kB_wr 用的是后者。
 
 ### 2.3 /proc/[pid]/status — 内存和上下文切换
 
