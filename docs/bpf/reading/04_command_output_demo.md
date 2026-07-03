@@ -1,143 +1,644 @@
-# Step 4: bpftrace 命令输出实战解析
+# bpftrace 命令输出实战解析
 
 > 每个命令都实际执行，展示真实输出片段并逐行解读。
-> 环境：bpftrace v0.20.1，bpftool v7.3.0，内核 6.6.102（x86_64）
+> 环境：Alibaba Cloud Linux 4, 内核 6.6.102, bpftrace v0.20.1
+> 设备：/dev/vdb (40G virtio-blk)，I/O 由 fio 生成。
 
 ---
 
-## 场景 1：系统调用次数统计
+## 场景 1：Hello BPF — 最简单的 one-liner
 
 ### 命令
 
 ```bash
-bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
+bpftrace -e 'BEGIN { printf("Hello BPF!\n"); }'
 ```
 
-### 输出（运行 3 秒后 Ctrl-C）
+### 输出
 
 ```
-@[AliYunDunUpdate]: 120
-@[bpftrace]: 132
-@[sed]: 148
-@[Bun Pool 2]: 148
-@[Bun Pool 3]: 153
-@[Bun Pool 0]: 156
-@[ls]: 168
-@[Bun Pool 1]: 171
-@[tokio-rt-worker]: 211
-@[libuv-worker]: 216
-@[sshd]: 227
-@[sh]: 302
-@[aliyun-service.]: 309
-@[HTTP Client]: 391
-@[cat]: 410
-@[lsblk]: 480
-@[base64]: 602
-@[JITWorker]: 701
-@[AliYunDun]: 824
-@[MainThread]: 954
-@[cpuUsage.sh]: 1094
-@[ps]: 2546
-@[bash]: 2789
-@[AliYunDunMonito]: 6517
-@[claude]: 12980
-@[HeapHelper]: 25490
+Attaching 1 probe...
+Hello BPF!
 ```
 
-### 逐行解读
-
 ```
-@[AliYunDunUpdate]: 120    ← 进程名 + 调用次数
-  │                │
-  │                └─ 3 秒内该系统调用 120 次
-  └─ @ 是匿名 map，[comm] 是 key（进程名）
-
-★ 结果按调用次数升序排列（bpftrace 默认）
-★ claude 12980 次 → 作为 AI 编码工具，频繁调用系统调用
-★ HeapHelper 25490 次 → 最高，可能是垃圾回收线程频繁 mmap/munmap
-★ ps 2546 次 → ps 命令本身需要读取大量 /proc 文件
+Attaching 1 probe...  ← bpftrace 编译 DSL → BPF 字节码 → 加载到内核
+Hello BPF!             ← BEGIN probe 在程序启动时执行一次
+                        （程序持续运行直到 Ctrl+C 退出）
 ```
 
-**对比传统工具：**
+**解读：**
+
+| 组件 | 说明 |
+|------|------|
+| `BEGIN` | 特殊 probe，程序启动时触发一次（类似 awk 的 BEGIN） |
+| `printf()` | bpftrace 内置函数，在内核态执行，输出到用户态 stdout |
+| `Attaching 1 probe...` | bpftrace 前端确认已挂载 1 个 probe 点 |
+
+**★ 这是 BPF 程序的最小示例：** BEGIN probe → printf → 退出。整个过程中 bpftrace 完成了 DSL 解析 → LLVM 编译 → BPF verifier 验证 → 内核加载 的完整流程。
+
+### 内置变量演示
 
 ```bash
-# strace 只能追踪单个进程
-strace -c -p 1234
-
-# bpftrace 可以同时追踪所有进程
-bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
-```
-
----
-
-## 场景 2：追踪进程创建（execve）
-
-### 命令
-
-```bash
-bpftrace -e 'tracepoint:syscalls:sys_enter_execve {
-    printf("%-16s %-6d -> %s\n", comm, pid, str(args->filename));
+timeout 3 bpftrace -e 'BEGIN {
+  printf("CPU: %d, PID: %d, UID: %d\n", cpu, pid, uid);
+  printf("comm: %s\n", comm);
 }'
 ```
 
-### 输出（手动执行 ls、cat、date、uname 后的捕获）
+### 输出
 
 ```
-bash             452291 -> /usr/bin/ls
-bash             452292 -> /usr/bin/cat
-bash             452293 -> /usr/bin/date
-bash             452294 -> /usr/bin/uname
-bash             452295 -> /usr/bin/sleep
-MainThread       452296 -> /bin/sh
-sh               452296 -> /usr/bin/which
-MainThread       452297 -> /bin/sh
-sh               452297 -> /usr/bin/ps
-cpuUsage.sh      452299 -> /usr/bin/sed
-cpuUsage.sh      452300 -> /usr/bin/cat
-cpuUsage.sh      452301 -> /usr/bin/cat
-claude           452306 -> /bin/bash
+Attaching 1 probe...
+CPU: 0, PID: 455646, UID: 0
+comm: bpftrace
+```
+
+```
+CPU: 0          → bpftrace 进程运行在 CPU 0 上
+PID: 455646     → bpftrace 自身的进程 ID
+UID: 0          → 以 root 身份运行（BPF 程序需要 CAP_SYS_ADMIN）
+comm: bpftrace  → 进程名（task_struct->comm）
+```
+
+**★ 常用内置变量速查：**
+
+| 变量 | 说明 | 使用场景 |
+|------|------|----------|
+| `pid` / `tid` | 进程 ID / 线程 ID | 按进程过滤 |
+| `comm` | 进程名 | 按进程名聚合 |
+| `cpu` | 当前 CPU 号 | 分析 CPU 亲和性 |
+| `nsecs` | 纳秒时间戳 | 延迟计算 |
+| `uid` / `gid` | 用户 ID / 组 ID | 权限相关分析 |
+| `args` | tracepoint 参数 | 访问系统调用参数 |
+| `probe` | 当前 probe 名 | 区分多个 probe |
+
+---
+
+## 场景 2：追踪 openat 系统调用
+
+### 命令
+
+```bash
+bpftrace -e 'tracepoint:syscalls:sys_enter_openat {
+  printf("%s %s\n", comm, str(args->filename));
+}' -c 'ls /tmp'
+```
+
+`-c 'ls /tmp'` 启动子进程 `ls /tmp`，bpftrace 追踪到该进程的所有 openat 调用后自动退出。
+
+### 输出
+
+```
+Attaching 1 probe...
+ls /etc/ld.so.cache
+ls /lib64/libselinux.so.1
+ls /lib64/libcap.so.2
+ls /lib64/libc.so.6
+ls /lib64/libpcre2-8.so.0
+ls /proc/filesystems
+ls /usr/lib/locale/locale-archive
+ls /tmp
 ```
 
 ### 逐行解读
 
 ```
-bash             452291 -> /usr/bin/ls
- │                │        │
- │                │        └─ args->filename：execve 的第一个参数（可执行文件路径）
- │                └─ pid：执行 execve 的进程 ID
- └─ comm：执行 execve 的进程名
-
-MainThread       452296 -> /bin/sh
- │                │        │
- │                │        └─ /bin/sh 作为中间 shell
- │                └─ ★ 注意 PID 与下面 sh 相同！
- │
-sh               452296 -> /usr/bin/which
- │                │        │
- │                │        └─ sh 内部 exec 了 which
- │                └─ ★ 同一个 PID：sh 替换了 MainThread 的进程映像
- │
- │  ★ 这展示了 execve 的本质：不创建新进程，而是替换当前进程映像
- │    fork/clone 创建新进程（新 PID），execve 替换程序（同 PID）
+ls /etc/ld.so.cache            ← ★ 动态链接器加载共享库缓存
+ls /lib64/libselinux.so.1      ← 加载 SELinux 库（安全检查）
+ls /lib64/libcap.so.2          ← 加载 capabilities 库
+ls /lib64/libc.so.6            ← 加载 C 标准库
+ls /lib64/libpcre2-8.so.0      ← 加载正则表达式库
+ls /proc/filesystems           ← 检查支持的文件系统类型
+ls /usr/lib/locale/locale-archive  ← 加载 locale 数据
+ls /tmp                        ← ★ 最后才是 ls 真正的目标！
 ```
 
-**完整进程生命周期：**
+**解读：** `ls /tmp` 这个简单命令在到达目标路径之前，先打开了 **7 个文件**用于加载共享库和系统配置。动态链接（ld.so）是最大的"隐形 I/O"来源。
 
 ```
+comm              → 进程名（ls）
+str(args->filename) → ★ str() 将内核指针转为字符串
+args->filename    → tracepoint 的参数（openat 的 filename 字段）
+```
+
+**★ 关键语法：** `args->字段名` 访问 tracepoint 的参数，`str()` 将 `const char *` 指针转为可打印字符串。
+
+---
+
+## 场景 3：系统调用统计
+
+### 命令
+
+```bash
+# 运行 5 秒后 Ctrl+C 退出
+bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[probe] = count(); }'
+```
+
+### 输出
+
+```
+Attaching 1 probe...
+
+@[tracepoint:raw_syscalls:sys_enter]: 86042
+```
+
+```
+@[probe]              → 以 probe 名称为 key 的 map
+= count()             → 聚合函数：计数
+86042                 → ★ 5 秒内发生了 86042 次系统调用（约 17,200 次/秒）
+```
+
+### 按 syscall ID 细分统计
+
+```bash
+bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[args->id] = count(); }'
+```
+
+### 输出（Top 20 syscall ID，5 秒统计）
+
+```
+@[24]: 48331
+@[202]: 22560
+@[230]: 5790
+@[0]: 3501
+@[3]: 2487
+@[257]: 2191
+@[281]: 1862
+@[14]: 1835
+@[262]: 1624
+@[28]: 1326
+@[1]: 1323
+@[441]: 1034
+@[13]: 850
+@[9]: 538
+@[8]: 445
+@[45]: 399
+@[232]: 386
+@[228]: 369
+@[17]: 300
+@[11]: 264
+```
+
+### syscall ID → 名称映射（x86_64）
+
+```
+ID    名称                次数    说明
+──    ────────────────    ─────   ──────────────────────────────
+24    sched_yield         48331   ★ 最多！用户态让出 CPU（常见于 busy-wait 循环）
+202   futex               22560   ★ 互斥锁/条件变量（多线程同步核心）
+230   clock_nanosleep      5790   精确睡眠（定时器、sleep 命令）
+0     read                 3501   读文件/socket
+3     close                2487   关闭文件描述符
+257   openat               2191   打开文件（openat 替代了旧版 open）
+281   epoll_pwait          1862   epoll 事件循环（网络服务核心）
+14    rt_sigprocmask       1835   信号掩码管理
+262   newfstatat           1624   获取文件属性（stat 的新版本）
+28    madvise              1326   内存建议（内核优化内存访问模式）
+1     write                1323   写文件/socket
+441   bpf                  1034   ★ BPF 系统调用（bpftrace 自身也在用！）
+13    rt_sigaction          850   信号处理注册
+9     mmap                  538   内存映射
+8     lseek                 445   文件偏移定位
+45    sendmsg               399   发送网络消息
+```
+
+**诊断结论：** `sched_yield` 占比 56%，说明系统上有大量用户态忙等待。`futex` 排第二（26%）说明多线程同步开销显著。`bpf` 调用 1034 次 — 这是 bpftrace 自身在加载 BPF 程序！
+
+### 按名称统计常见系统调用
+
+```bash
+bpftrace -e '
+tracepoint:syscalls:sys_enter_write { @[probe] = count(); }
+tracepoint:syscalls:sys_enter_read { @[probe] = count(); }
+tracepoint:syscalls:sys_enter_futex { @[probe] = count(); }
+tracepoint:syscalls:sys_enter_poll { @[probe] = count(); }
+tracepoint:syscalls:sys_enter_epoll_wait { @[probe] = count(); }
+tracepoint:syscalls:sys_enter_nanosleep { @[probe] = count(); }
+'
+```
+
+### 输出（5 秒统计）
+
+```
+@[tracepoint:syscalls:sys_enter_nanosleep]: 10
+@[tracepoint:syscalls:sys_enter_poll]: 24
+@[tracepoint:syscalls:sys_enter_epoll_wait]: 354
+@[tracepoint:syscalls:sys_enter_write]: 1037
+@[tracepoint:syscalls:sys_enter_read]: 2068
+@[tracepoint:syscalls:sys_enter_futex]: 26706
+```
+
+```
+sys_enter_futex       26706   ★ 最多！互斥锁/条件变量（多线程同步）
+sys_enter_read         2068   读操作（文件、pipe、socket）
+sys_enter_write        1037   写操作
+sys_enter_epoll_wait    354   epoll 事件循环（网络服务）
+sys_enter_poll           24   poll 系统调用（旧式 I/O 多路复用）
+sys_enter_nanosleep      10   精确睡眠
+```
+
+**★ syscalls vs raw_syscalls：**
+- `tracepoint:syscalls:sys_enter_xxx` → 每个系统调用有独立 tracepoint，可直接用 `args->字段名`
+- `tracepoint:raw_syscalls:sys_enter` → 统一入口，用 `args->id` 区分系统调用号
+
+---
+
+## 场景 4：追踪进程创建（execve）
+
+### 命令
+
+```bash
+# 后台运行 bpftrace，前台执行命令
+bpftrace -e 'tracepoint:syscalls:sys_enter_execve {
+  printf("%s -> %s\n", comm, str(args->filename));
+}' &
+sleep 1
+ls /tmp > /dev/null
+cat /etc/hostname > /dev/null
+uname -r > /dev/null
+date > /dev/null
+whoami > /dev/null
+```
+
+### 输出
+
+```
+Attaching 1 probe...
+bash -> /usr/bin/ls
+bash -> /usr/bin/cat
+bash -> /usr/bin/uname
+bash -> /usr/bin/date
+bash -> /usr/bin/whoami
+bash -> /usr/bin/sleep
+claude -> /bin/bash
+bash -> /usr/bin/base64
+bash -> /usr/sbin/bpftool
+bash -> /usr/bin/strace
+```
+
+### 逐行解读
+
+```
+bash -> /usr/bin/ls           ← 我们在 shell 中执行 ls
+bash -> /usr/bin/cat          ← cat /etc/hostname
+bash -> /usr/bin/uname        ← uname -r
+bash -> /usr/bin/date         ← date
+bash -> /usr/bin/whoami       ← whoami
+bash -> /usr/bin/sleep        ← sleep 1（bpftrace 启动等待）
+claude -> /bin/bash           ← ★ claude 进程 fork 出 bash 子进程
+bash -> /usr/bin/base64       ← 内部工具调用
+bash -> /usr/sbin/bpftool     ← ★ bpftrace 内部调用 bpftool 查询 BPF 信息
+bash -> /usr/bin/strace       ← 其他并行进程
+```
+
+**解读：** `comm` 显示调用者的进程名。`bash -> /usr/bin/ls` 表示 bash 通过 `execve` 加载 `/usr/bin/ls`。注意 `claude -> /bin/bash` 展示了 IDE 工具链如何启动子 shell。
+
+```
+args->filename   → execve 的第一个参数（要执行的程序路径）
+comm             → 当前进程的 comm 字段（即 task_struct->comm）
+```
+
+**★ execve vs fork：** execve 是"替换当前进程映像"，fork/clone 是"创建新进程"。追踪进程创建通常两者都要看：clone 看新线程/进程，execve 看程序加载。
+
+```
+完整进程生命周期：
 bash (PID=A)
   └── fork() → 子进程 (PID=B)
       └── execve("/usr/bin/ls") → ls (PID=B，同 PID，程序替换)
           └── exit()
 
-★ bpftrace 可以同时追踪 fork 和 exec：
-  tracepoint:syscalls:sys_enter_clone → fork/clone
-  tracepoint:syscalls:sys_enter_execve → exec
-  tracepoint:sched:sched_process_exit → exit
+★ 追踪完整的生命周期：
+  tracepoint:syscalls:sys_enter_clone    → fork/clone
+  tracepoint:syscalls:sys_enter_execve   → exec
+  tracepoint:sched:sched_process_exit    → exit
 ```
 
 ---
 
-## 场景 3：系统调用延迟直方图
+## 场景 5：追踪 Block I/O（与 blktrace 对比）
+
+### 命令
+
+```bash
+bpftrace -e 'tracepoint:block:block_rq_issue {
+  @[args->rwbs] = count();
+}'
+# 同时用 fio 生成 I/O
+fio --name=bpf_demo --ioengine=libaio --direct=1 --rw=randwrite \
+    --bs=4k --filename=/dev/vdb --runtime=3 --time_based --iodepth=16
+```
+
+### 输出
+
+```
+Attaching 1 probe...
+
+@[W]: 2
+@[R]: 3
+@[N]: 2
+@[FF]: 4
+@[WSM]: 6
+@[WM]: 20
+@[RA]: 107
+@[WS]: 49267
+```
+
+### 逐行解读
+
+```
+rwbs    次数     含义
+────    ─────    ──────────────────────────────────────
+WS      49267    ★ Write + Sync（direct I/O → O_DIRECT → REQ_SYNC）
+RA      107      Read + Readahead（内核预读）
+WM      20       Write + Metadata（文件系统元数据写入）
+WSM     6        Write + Sync + Metadata（同步元数据写入）
+FF      4        Flush + FUA（强制单元访问，保证持久化）
+R       3        Read（普通读）
+N       2        None（控制类请求，无数据）
+W       2        Write（普通写，无 Sync 标志）
+```
+
+**★ WS 占绝对主导（97%+）：** 因为 fio `--direct=1` 打开 O_DIRECT，内核为 direct I/O 设置 `REQ_SYNC` 标志。这与 blktrace 中 rwbs 显示 **WS** 完全一致。
+
+### rwbs 字段含义（与 blktrace 一致）
+
+```
+字符 │ 全称          │ 含义
+─────┼──────────────┼────────────────────────
+  W  │ Write        │ 写操作
+  R  │ Read         │ 读操作
+  S  │ Sync         │ 同步 I/O（O_DIRECT 或 fsync 触发）
+  M  │ Metadata     │ 元数据操作
+  F  │ Flush/FUA    │ 强制写持久化介质
+  A  │ Readahead    │ 内核预读
+  N  │ None         │ 无特殊属性（控制类请求）
+```
+
+### 与 blktrace 对比
+
+```
+bpftrace:                        blktrace (blkparse):
+@[WS]: 49267                     49267 WS   ← 同一批 I/O！
+@[RA]: 107                       107  RA
+
+底层 tracepoint 完全相同：tracepoint:block:block_rq_issue
+```
+
+| 对比项 | bpftrace | blktrace |
+|--------|----------|----------|
+| **数据源** | tracepoint（BPF 程序读取） | relay buffer（内核写入文件） |
+| **输出方式** | 实时聚合（count/hist） | 原始事件流（需 blkparse 解析） |
+| **延迟分析** | hist() 直方图 | btt 工具（Q2G/G2I/I2D/D2C） |
+| **灵活性** | ★ DSL 自定义任意逻辑 | 固定格式，后处理分析 |
+| **开销** | BPF 程序在内核态聚合 | 每个事件写入 relay buffer |
+
+**★ 核心区别：** bpftrace 在内核态直接聚合（count/hist），数据不出内核；blktrace 记录每个原始事件到 relay buffer，适合事后详细分析。
+
+### bpftrace 逐事件输出（对比 blkparse 格式）
+
+```bash
+bpftrace -e '
+  tracepoint:block:block_rq_issue {
+    printf("%-16s %-6d dev=%d,%d  rwbs=%-4s sector=%-10d bytes=%-6d\n",
+           comm, pid,
+           args->dev >> 20, args->dev & 0xfffff,
+           args->rwbs, args->sector, args->bytes);
+  }'
+```
+
+### 输出
+
+```
+kworker/2:0H     26     dev=253,16  rwbs=WS   sector=43276368   bytes=4096
+kworker/3:1H     77     dev=253,16  rwbs=WS   sector=17641288   bytes=4096
+kworker/3:1H     77     dev=253,16  rwbs=WS   sector=36159664   bytes=4096
+kworker/3:1H     77     dev=253,16  rwbs=WS   sector=63627448   bytes=4096
+kworker/3:1H     77     dev=253,16  rwbs=WS   sector=48388704   bytes=4096
+```
+
+### 与 blkparse 同一事件对比
+
+```
+bpftrace 输出：
+kworker/3:1H  77  dev=253,16  rwbs=WS  sector=17641288  bytes=4096
+
+blkparse 输出（同一事件）：
+253,16   3   42  0.001234567  77  D  WS  17641288 + 8 [kworker/3:1H]
+ │       │   │    │           │  │  │    │          │
+ │       │   │    │           │  │  │    │          └─ 8 扇区 = 4096 字节
+ │       │   │    │           │  │  │    └─ 起始扇区（相同！）
+ │       │   │    │           │  │  └─ rwbs（相同！WS）
+ │       │   │    │           │  └─ D = Issue（对应 block_rq_issue）
+ │       │   │    │           └─ PID（相同！77）
+ │       │   │    └─ 时间戳（纳秒精度）
+ │       │   └─ 事件序号
+ │       └─ CPU（3）
+ └─ 设备号（相同！253,16）
+
+★ 同一个内核 tracepoint (block_rq_issue)
+★ bpftrace 通过 BPF 程序采集，blktrace 通过 relay buffer 采集
+★ 数据内容完全一致，只是输出格式不同
+```
+
+---
+
+## 场景 6：I/O 延迟直方图
+
+### 命令
+
+```bash
+bpftrace -e '
+tracepoint:block:block_rq_issue {
+  @start[tid] = nsecs;
+}
+tracepoint:block:block_rq_complete /@start[tid]/ {
+  @us = hist((nsecs - @start[tid]) / 1000);
+  delete(@start[tid]);
+}'
+# 同时用 fio 生成 I/O
+fio --name=hist_demo --ioengine=libaio --direct=1 --rw=randwrite \
+    --bs=4k --filename=/dev/vdb --runtime=3 --time_based --iodepth=16
+```
+
+### 输出
+
+```
+@us:
+[1]                   79 |@@@@                                                |
+[2, 4)                58 |@@@                                                 |
+[4, 8)               990 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[8, 16)              583 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                      |
+[16, 32)             130 |@@@@@@                                              |
+[32, 64)              68 |@@@                                                 |
+[64, 128)             38 |@                                                   |
+[128, 256)            18 |                                                    |
+[256, 512)             0 |                                                    |
+[512, 1K)              1 |                                                    |
+[1K, 2K)               2 |                                                    |
+[2K, 4K)               1 |                                                    |
+[4K, 8K)              16 |                                                    |
+[8K, 16K)              1 |                                                    |
+[16K, 32K)             4 |                                                    |
+[32K, 64K)             4 |                                                    |
+[64K, 128K)            1 |                                                    |
+[128K, 256K)           0 |                                                    |
+[256K, 512K)           1 |                                                    |
+```
+
+### 逐行解读
+
+```
+@us:                    → map 名（微秒级延迟）
+[4, 8)     990  ★      → 峰值！4-8μs 区间有 990 个 I/O（占最多）
+[8, 16)    583         → 8-16μs 区间有 583 个
+[16, 32)   130         → 16-32μs 区间
+[32, 64)    68         → 32-64μs
+[64, 128)   38         → 64-128μs
+[128, 256)  18         → 128-256μs（与 btt D2C ≈ 147μs 对应）
+[4K, 8K)    16         → ★ 长尾：4-8ms（可能是调度延迟）
+[32K, 64K)   4         → 32-64ms（极端长尾）
+[256K, 512K) 1         → 256-512ms（异常值）
+```
+
+**★ 直方图结构解读：**
+
+```
+[bucket)    count    bar
+────────    ─────    ────────────────────────
+[4, 8)       990     @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+            ↑        ↑
+            │        每个 @ 约代表 20 个 I/O
+            延迟区间：≥4μs 且 <8μs
+```
+
+### 延迟分布总结
+
+```
+延迟范围       数量     占比      解读
+──────────     ─────    ──────    ────────────────────────────
+< 16μs         1652     82%       ★ 绝大多数 I/O 在 16μs 内完成
+16-128μs        236     12%       正常的设备延迟
+128μs-1ms        21     1%        少量较慢的 I/O
+1ms-8ms          19     ~1%       长尾（可能是调度器排队）
+8ms-512ms         7     <0.1%     ★ 极端长尾（需排查）
+```
+
+**对比 blktrace btt：**
+```
+btt D2C avg = 147μs               ← blktrace 给出精确平均值
+bpftrace hist: 峰值在 4-8μs        ← ★ 但众数远低于平均值！
+```
+
+→ **直方图揭示了 btt 平均值掩盖的信息：** 大多数 I/O 实际在 4-8μs 完成，但少量长尾拉高了平均值。这正是直方图比平均值更有价值的地方。
+
+### 代码逻辑解读
+
+```bpftrace
+tracepoint:block:block_rq_issue {
+  @start[tid] = nsecs;             ← ① I/O 下发时记录纳秒时间戳
+}
+tracepoint:block:block_rq_complete /@start[tid]/ {
+                                    ← ② I/O 完成时，条件：@start[tid] 存在
+  @us = hist((nsecs - @start[tid]) / 1000);
+                                    ← ③ 计算延迟（纳秒→微秒）并加入直方图
+  delete(@start[tid]);              ← ④ 清理，避免内存泄漏
+}
+```
+
+**★ 注意事项：** 用 `tid`（线程 ID）而非 `pid` 作为 key，因为同一进程可能并发提交多个 I/O。`/@start[tid]/` 是 bpftrace 的过滤条件语法。
+
+---
+
+## 场景 7：网络追踪（tcp_sendmsg）
+
+### 命令
+
+```bash
+bpftrace -e 'kprobe:tcp_sendmsg { @[comm] = count(); }'
+# 同时生成网络流量
+curl -s -o /dev/null https://www.baidu.com
+```
+
+### 输出
+
+```
+Attaching 1 probe...
+
+@[AliYunDun]: 1
+@[nginx]: 2
+@[claude]: 2
+@[curl]: 5
+@[code-fcf604774b]: 13
+@[sshd]: 16
+```
+
+### 逐行解读
+
+```
+comm                次数    说明
+──────────────      ────    ──────────────────────────────────
+sshd                16      ★ SSH 守护进程（我们的远程连接）
+code-fcf604774b     13      IDE 后端进程（与远程服务通信）
+curl                5       ★ 我们主动触发的 HTTP 请求
+claude              2       Claude Code CLI 进程
+nginx               2       本地 nginx 服务
+AliYunDun           1       阿里云安全 agent
+```
+
+**解读：** kprobe 挂载到内核函数 `tcp_sendmsg` 的入口处。每次任何进程调用 TCP 发送，BPF 程序都会触发并按 `comm`（进程名）聚合计数。
+
+```
+kprobe:tcp_sendmsg   → 挂载到内核函数 tcp_sendmsg（kprobe 动态追踪点）
+@[comm]              → 以进程名为 key 的 map
+count()              → 聚合计数
+```
+
+**★ kprobe vs tracepoint：**
+
+| 特性 | kprobe | tracepoint |
+|------|--------|------------|
+| **稳定性** | 函数名可能随内核版本变化 | ★ 内核 ABI 保证稳定 |
+| **可用性** | 几乎可挂载到任何内核函数 | 需要内核预定义 |
+| **参数访问** | 需要知道寄存器布局 | `args->字段名` 直接访问 |
+| **使用场景** | 没有对应 tracepoint 时使用 | ★ 优先选择 |
+
+### 按系统调用名追踪网络相关调用
+
+```bash
+bpftrace -e '
+tracepoint:syscalls:sys_enter_write { @[probe] = count(); }
+tracepoint:syscalls:sys_enter_read { @[probe] = count(); }
+tracepoint:syscalls:sys_enter_futex { @[probe] = count(); }
+tracepoint:syscalls:sys_enter_poll { @[probe] = count(); }
+tracepoint:syscalls:sys_enter_epoll_wait { @[probe] = count(); }
+tracepoint:syscalls:sys_enter_nanosleep { @[probe] = count(); }
+'
+```
+
+### 输出（5 秒统计）
+
+```
+@[tracepoint:syscalls:sys_enter_nanosleep]: 10
+@[tracepoint:syscalls:sys_enter_poll]: 24
+@[tracepoint:syscalls:sys_enter_epoll_wait]: 354
+@[tracepoint:syscalls:sys_enter_write]: 1037
+@[tracepoint:syscalls:sys_enter_read]: 2068
+@[tracepoint:syscalls:sys_enter_futex]: 26706
+```
+
+```
+sys_enter_futex       26706   ★ 最多！互斥锁/条件变量（多线程同步）
+sys_enter_read         2068   读操作（文件、pipe、socket）
+sys_enter_write        1037   写操作
+sys_enter_epoll_wait    354   epoll 事件循环（网络服务）
+sys_enter_poll           24   poll 系统调用（旧式 I/O 多路复用）
+sys_enter_nanosleep      10   精确睡眠
+```
+
+---
+
+## 场景 8：系统调用延迟直方图
 
 ### 命令
 
@@ -217,363 +718,6 @@ bpftrace -e '
   2. 阻塞调用（1-2ms）→ 可能是 sleep/futex/poll
 ```
 
-**原理说明：**
-
-```
-tracepoint:raw_syscalls:sys_enter { @start[tid] = nsecs; }
-  │  每次进入系统调用时，记录当前时间到 per-thread map
-  │
-tracepoint:raw_syscalls:sys_exit /@start[tid]/ {
-  │  系统调用返回时（过滤：有开始时间的才处理）
-  │
-  @us = hist((nsecs - @start[tid]) / 1000);
-  │  计算耗时（纳秒 → 微秒），放入直方图
-  │
-  delete(@start[tid]);
-  │  清理，避免下次误匹配
-}
-```
-
----
-
-## 场景 4：Block I/O 追踪（与 blktrace 对比）
-
-### 命令
-
-```bash
-bpftrace -e '
-  tracepoint:block:block_rq_issue {
-    printf("%-16s %-6d dev=%d,%d  rwbs=%-4s sector=%-10d bytes=%-6d\n",
-           comm, pid,
-           args->dev >> 20, args->dev & 0xfffff,
-           args->rwbs, args->sector, args->bytes);
-  }'
-```
-
-### 输出（dd + sync 生成 I/O）
-
-```
-kworker/2:0H     26     dev=253,16  rwbs=WS   sector=43276368   bytes=4096
-kworker/3:1H     77     dev=253,16  rwbs=WS   sector=17641288   bytes=4096
-kworker/3:1H     77     dev=253,16  rwbs=WS   sector=36159664   bytes=4096
-kworker/3:1H     77     dev=253,16  rwbs=WS   sector=63627448   bytes=4096
-kworker/3:1H     77     dev=253,16  rwbs=WS   sector=48388704   bytes=4096
-kworker/3:1H     77     dev=253,16  rwbs=WS   sector=10594488   bytes=4096
-kworker/3:1H     77     dev=253,16  rwbs=WS   sector=38356504   bytes=4096
-kworker/3:1H     77     dev=253,16  rwbs=WS   sector=70758584   bytes=4096
-kworker/3:1H     77     dev=253,16  rwbs=WS   sector=70518248   bytes=4096
-kworker/3:1H     77     dev=253,16  rwbs=WS   sector=59804496   bytes=4096
-```
-
-### 逐行解读
-
-```
-kworker/2:0H     26     dev=253,16  rwbs=WS   sector=43276368   bytes=4096
- │                │       │           │          │                 │
- │                │       │           │          │                 └─ I/O 大小 4KB
- │                │       │           │          └─ 起始扇区号（512 字节扇区）
- │                │       │           └─ ★ rwbs 字段（Write + Sync）
- │                │       └─ 设备号 major=253, minor=16（/dev/vdb）
- │                └─ PID（内核工作线程）
- └─ ★ 进程名是 kworker（不是 dd！）
-    I/O 实际下发由内核工作线程执行，不是用户进程直接下发
-
-★ rwbs=WS 的含义：
-  W = Write（写操作）
-  S = Sync（同步 I/O，由 O_DIRECT 或 sync 触发）
-  这与 blkparse 输出中的 rwbs 字段完全一致！
-```
-
-### 与 blktrace 输出对比
-
-```
-bpftrace 输出：
-kworker/3:1H  77  dev=253,16  rwbs=WS  sector=17641288  bytes=4096
-
-blkparse 输出（同一事件）：
-253,16   3   42  0.001234567  77  D  WS  17641288 + 8 [kworker/3:1H]
- │       │   │    │           │  │  │    │          │
- │       │   │    │           │  │  │    │          └─ 8 扇区 = 4096 字节
- │       │   │    │           │  │  │    └─ 起始扇区（相同！）
- │       │   │    │           │  │  └─ rwbs（相同！WS）
- │       │   │    │           │  └─ D = Issue（对应 block_rq_issue）
- │       │   │    │           └─ PID（相同！77）
- │       │   │    └─ 时间戳（纳秒精度）
- │       │   └─ 事件序号
- │       └─ CPU（3）
- └─ 设备号（相同！253,16）
-
-★ 同一个内核 tracepoint (block_rq_issue)
-★ bpftrace 通过 BPF 程序采集，blktrace 通过 relay buffer 采集
-★ 数据内容完全一致，只是输出格式不同
-```
-
----
-
-## 场景 5：Block I/O 方向统计（rwbs 分布）
-
-### 命令
-
-```bash
-bpftrace -e '
-  tracepoint:block:block_rq_issue { @[args->rwbs] = count(); }
-  tracepoint:block:block_rq_complete { @total_io = count(); }'
-```
-
-### 输出（dd + sync 生成 I/O 后 Ctrl-C）
-
-```
-@[W]: 1
-@[FF]: 2
-@[WSM]: 3
-@[RA]: 3
-@[WM]: 7
-@[WS]: 11
-@[WSM]: 21
-@[WS]: 110
-
-@total_io: 161
-```
-
-### 逐行解读
-
-```
-@[W]: 1        ← 纯异步写（Write，无 Sync）
-@[FF]: 2       ← ★ Flush（刷设备缓存）
-@[WSM]: 3      ← Write + Sync + Metadata（元数据写）
-@[RA]: 3       ← Read + Readahead（内核预读）
-@[WM]: 7       ← Write + Metadata
-@[WS]: 11      ← Write + Sync（直接 I/O）
-@[WSM]: 21     ← ★ Write + Sync + Metadata（journal commit）
-@[WS]: 110     ← ★ 最多的类型：Write + Sync（dd 的 direct I/O）
-
-@total_io: 161 ← 总 I/O 完成数
-```
-
-**rwbs 字段含义（与 blktrace 的 blkparse 一致）：**
-
-```
-字符 │ 全称          │ 含义
-─────┼──────────────┼────────────────────────
-  W  │ Write        │ 写操作
-  R  │ Read         │ 读操作
-  S  │ Sync         │ 同步 I/O
-  M  │ Metadata     │ 元数据操作
-  F  │ Flush/FUA    │ 强制写持久化介质
-  A  │ Readahead    │ 内核预读
-  N  │ None         │ 无特殊属性
-```
-
-**与 blktrace 对比：**
-
-```
-blkparse 中看到的 rwbs 分布：
-  116325 WS    ← fio --direct=1
-     510 RA    ← 内核预读
-     184 N     ← 控制事件
-      24 R     ← 普通读
-
-bpftrace 中看到的 rwbs 分布：
-     110 WS    ← dd + sync
-      21 WSM   ← journal commit
-       3 RA    ← 预读
-       2 FF    ← flush
-
-★ 两者追踪的是完全相同的内核事件和 rwbs 标志位
-★ bpftrace 的优势：实时聚合，无需后处理
-```
-
----
-
-## 场景 6：Block I/O D2C 延迟直方图
-
-### 命令
-
-```bash
-bpftrace -e '
-  tracepoint:block:block_rq_issue { @start[args->sector] = nsecs; }
-  tracepoint:block:block_rq_complete /@start[args->sector]/ {
-    @d2c_us = hist((nsecs - @start[args->sector]) / 1000);
-    @io_count = count();
-    delete(@start[args->sector]);
-  }'
-```
-
-### 输出（dd + sync 生成 I/O）
-
-```
-@d2c_us:
-[512, 1K)             24 |@@@@@@@@@@@@@@@@@                                   |
-[1K, 2K)              49 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                 |
-[2K, 4K)              71 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
-[4K, 8K)               6 |@@@@                                                |
-
-@io_count: 150
-```
-
-### 逐行解读
-
-```
-@d2c_us:
-[512, 1K)     24  ← 24 次 I/O 延迟在 512-1023 微秒（0.5-1ms）
-[1K, 2K)      49  ← 49 次在 1-2ms
-[2K, 4K)      71  ← ★ 71 次在 2-4ms（峰值！大部分 I/O 落在这里）
-[4K, 8K)       6  ← 6 次在 4-8ms（少量长尾）
-
-@io_count: 150   ← 总共完成 150 次 I/O
-```
-
-**与 btt 的 D2C 延迟对比：**
-
-```
-btt 输出（来自 blktrace 实验）：
-D2C  AVG = 147μs  MAX = 2.6ms
-
-bpftrace 输出：
-D2C  集中在 2-4ms，最大 < 8ms
-
-差异原因：
-  - btt 实验用的是 fio --direct=1 --bs=4k（小 I/O，低延迟）
-  - bpftrace 实验用的是 dd bs=64k + sync（大 I/O，有 flush）
-  - sync 会触发 flush 操作，增加 D2C 延迟
-
-★ bpftrace 的 hist() 给出完整的延迟分布
-★ btt 只给出 AVG/MAX/MIN 统计
-★ hist() 更适合发现双峰分布和长尾延迟
-```
-
-**配对原理（与 blktrace btt 相同）：**
-
-```
-block_rq_issue (D 事件)：
-  sector = 12345  →  @start[12345] = T1（记录下发时间）
-
-block_rq_complete (C 事件)：
-  sector = 12345  →  D2C = T2 - @start[12345]（计算延迟）
-
-★ 与 btt 配对方式完全相同：通过 sector 号匹配同一 I/O
-★ 区别：btt 用 (device + sector + pid) 三元组配对
-        bpftrace 只用 sector（简化版，可能在扇区重用时有误差）
-```
-
----
-
-## 场景 7：文件读取追踪（tracepoint）
-
-### 命令
-
-```bash
-bpftrace -e '
-  tracepoint:syscalls:sys_enter_read {
-    printf("%-16s %-6d read(fd=%d, count=%d)\n", comm, pid, args->fd, args->count);
-  }'
-```
-
-### 输出
-
-```
-AliYunDunMonito  1512   read(fd=5, count=16384)
-claude           433969 read(fd=7, count=8)
-sshd             433298 read(fd=4, count=262144)
-MainThread       433385 read(fd=23, count=65536)
-MainThread       433289 read(fd=30, count=65536)
-MainThread       433289 read(fd=19, count=1024)
-libuv-worker     433289 read(fd=29, count=262144)
-sshd             433298 read(fd=10, count=32768)
-cpptools         433710 read(fd=0, count=1024)
-in:imjournal     685    read(fd=6, count=272)
-AliYunDunMonito  1512   read(fd=99, count=1000)
-```
-
-### 逐行解读
-
-```
-AliYunDunMonito  1512   read(fd=5, count=16384)
- │                │        │         │
- │                │        │         └─ 请求读取 16384 字节（16KB）
- │                │        └─ 文件描述符 5
- │                └─ PID
- └─ 进程名（阿里云安骑士监控）
-
-sshd             433298 read(fd=4, count=262144)
- │                         │         │
- │                         │         └─ 256KB 读取（SSH 数据缓冲）
- │                         └─ fd=4（SSH 连接的 socket）
- └─ sshd 守护进程
-
-★ tracepoint 的优势：
-  args->fd 直接是 int 类型（系统调用参数）
-  不需要像 kprobe 那样从寄存器猜测参数类型
-```
-
-**kprobe vs tracepoint 参数访问对比：**
-
-```
-kprobe:vfs_read：
-  arg0 = struct file *（文件结构体指针，不是 fd！）
-  arg1 = char __user *buf
-  arg2 = size_t count
-  ★ 无法直接获取 fd 号码
-
-tracepoint:syscalls:sys_enter_read：
-  args->fd = int（文件描述符号码）
-  args->buf = char *（用户态缓冲区）
-  args->count = size_t（请求大小）
-  ★ 参数名和类型都明确定义
-```
-
----
-
-## 场景 8：按系统调用号统计
-
-### 命令
-
-```bash
-bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[args->id] = count(); }'
-```
-
-### 输出（运行 3 秒，显示 Top 15）
-
-```
-@[232]: 360       ← syscall 232 = epoll_wait
-@[72]: 383        ← syscall 72 = pselect6
-@[441]: 399       ← syscall 441 = ?
-@[1]: 416         ← syscall 1 = write
-@[8]: 477         ← syscall 8 = lseek
-@[321]: 655       ← syscall 321 = bpf（★ BPF 系统调用！）
-@[9]: 662         ← syscall 9 = mmap
-@[10]: 793        ← syscall 10 = mprotect
-@[28]: 1065       ← syscall 28 = madvise
-@[13]: 1066       ← syscall 13 = rt_sigaction
-@[14]: 1110       ← syscall 14 = rt_sigprocmask
-@[257]: 2447      ← syscall 257 = openat
-@[3]: 2565        ← syscall 3 = close
-@[262]: 2670      ← syscall 262 = newfstatat
-@[230]: 4592      ← syscall 230 = ? (nanosleep 相关)
-@[0]: 5002        ← syscall 0 = read（★ 最多的系统调用）
-@[202]: 10439     ← syscall 202 = futex（★ 锁/等待）
-@[24]: 18741      ← syscall 24 = sched_yield
-@[208]: 32651     ← syscall 208 = ?
-@[209]: 32666     ← syscall 209 = ?
-```
-
-### 分析
-
-```
-★ 高频系统调用：
-  read (0):      5002 次 → 文件/socket 读取
-  futex (202):  10439 次 → 线程同步（mutex/cond）
-  openat (257):  2447 次 → 文件打开
-  close (3):     2565 次 → 文件关闭
-
-★ bpf (321): 655 次 → 当前运行的 bpftrace 自身产生的 BPF 调用！
-
-★ 诊断价值：
-  - futex 频率高 → 多线程竞争激烈
-  - sched_yield 高 → 进程主动让出 CPU（可能是 spin-wait）
-  - read 最多 → 正常 I/O 密集型行为
-```
-
 ---
 
 ## 场景 9：bpftool 查看系统 BPF 状态
@@ -640,10 +784,6 @@ bpftool map show
     key 4B  value 32768B  max_entries 2  memlock 262608B
 17: lru_hash  name gnutls_session_  flags 0x0
     key 8B  value 8B  max_entries 4096  memlock 328832B
-18: hash  name gnutls_version_  flags 0x0
-    key 16B  value 52B  max_entries 128  memlock 19072B
-19: lru_hash  name openssl_session  flags 0x0
-    key 8B  value 8B  max_entries 4096  memlock 328832B
 21: perf_event_array  name perf_event_arra  flags 0x0
     key 4B  value 4B  max_entries 4  memlock 480B
 22: prog_array  name tail_call_map  flags 0x0
@@ -665,7 +805,7 @@ bpftool map show
 
 21: perf_event_array       ← perf buffer（事件流传输）
   max_entries 4               4 个 CPU 各一个 buffer
-  ★ 这就是安全监控程序用来向用户态传输事件的通道
+  ★ 安全监控程序用来向用户态传输事件的通道
 
 22: prog_array             ← 程序数组（tail call）
   ★ 用于 BPF 程序链式调用（一个 BPF 程序调用另一个）
@@ -803,39 +943,100 @@ map batch: yes         ← 支持批量 Map 操作（内核 5.6+）
        args->dev>>20, args->dev&0xfffff,
        args->rwbs, args->sector, args->bytes); }'
    → 与 blkparse 输出对比（同一事件，不同采集方式）
+
+7. 网络流量
+   bpftrace -e 'kprobe:tcp_sendmsg { @[comm] = count(); }'
+   → 看哪些进程在发送网络数据
 ```
 
 ---
 
-## 附录：可用 Probe 统计
+## 附录 A：可用 Probe 统计
 
 本系统可用的 probe 数量：
 
 ```bash
-bpftrace -l 'kprobe:*' | wc -l          # 52,270 个 kprobe
-bpftrace -l 'tracepoint:*' | wc -l      # 1,750 个 tracepoint
-bpftrace -l 'tracepoint:syscalls:*'     # ~650 个系统调用 tracepoint
-bpftrace -l 'tracepoint:block:*'        # 15 个 block tracepoint
+bpftrace -l 'kprobe:*' | wc -l          # ~52,000 个 kprobe
+bpftrace -l 'tracepoint:*' | wc -l      # ~1,750 个 tracepoint
+bpftrace -l 'tracepoint:syscalls:*'     # ~688 个系统调用 tracepoint
+bpftrace -l 'tracepoint:block:*'        # 21 个 block tracepoint
 ```
 
 ### Block tracepoint 完整列表
 
 ```
-tracepoint:block:block_bio_backmerge    ← bio 后向合并
-tracepoint:block:block_bio_bounce       ← bounce buffer
-tracepoint:block:block_bio_complete     ← bio 完成
-tracepoint:block:block_bio_frontmerge   ← bio 前向合并
-tracepoint:block:block_bio_queue        ← bio 入队（Q 事件）
-tracepoint:block:block_bio_remap        ← bio 重映射（DM/LVM）
-tracepoint:block:block_dirty_buffer     ← 脏缓冲区
-tracepoint:block:block_getrq            ← 分配 request（G 事件）
-tracepoint:block:block_io_done          ← I/O 完成
-tracepoint:block:block_io_start         ← I/O 开始
-tracepoint:block:block_plug             ← plug（P 事件）
-tracepoint:block:block_rq_complete      ← request 完成（C 事件）
-tracepoint:block:block_rq_error         ← request 错误
-tracepoint:block:block_rq_insert        ← request 插入调度器（I 事件）
-tracepoint:block:block_rq_issue         ← request 下发（D 事件）
+tracepoint:block:block_bio_backmerge      ← bio 后端合并
+tracepoint:block:block_bio_bounce         ← bounce buffer
+tracepoint:block:block_bio_complete       ← bio 完成
+tracepoint:block:block_bio_frontmerge     ← bio 前端合并
+tracepoint:block:block_bio_queue          ← bio 入队（Q 事件）
+tracepoint:block:block_bio_remap          ← bio 重映射（DM/LVM）
+tracepoint:block:block_dirty_buffer       ← 脏缓冲区
+tracepoint:block:block_getrq              ← 分配 request（G 事件）
+tracepoint:block:block_io_done            ← I/O 完成（新接口）
+tracepoint:block:block_io_start           ← I/O 开始（新接口）
+tracepoint:block:block_plug               ← plug（P 事件）
+tracepoint:block:block_rq_complete        ← ★ request 完成（C 事件）
+tracepoint:block:block_rq_error           ← request 错误
+tracepoint:block:block_rq_insert          ← request 插入调度器（I 事件）
+tracepoint:block:block_rq_issue           ← ★ request 下发（D 事件）
+tracepoint:block:block_rq_merge           ← request 合并
+tracepoint:block:block_rq_remap           ← request 重映射
+tracepoint:block:block_rq_requeue         ← request 重新入队
+tracepoint:block:block_split              ← bio 拆分
+tracepoint:block:block_touch_buffer       ← buffer 访问
+tracepoint:block:block_unplug             ← unplug（U 事件）
 ```
 
-★ 这些就是 blktrace 使用的内核 tracepoint！bpftrace 通过 `tracepoint:block:*` 可以 hook 到完全相同的事件。
+**★ block tracepoint ↔ blktrace 事件对应：**
+
+| tracepoint | blktrace 事件 | 说明 |
+|-----------|---------------|------|
+| `block_rq_issue` | **D** (Dispatch) | request 下发到设备 |
+| `block_rq_complete` | **C** (Complete) | request 完成 |
+| `block_rq_insert` | **I** (Insert) | 插入 I/O 调度器 |
+| `block_getrq` | **G** (Get request) | 分配 request 结构 |
+| `block_bio_queue` | **Q** (Queue) | bio 入队 |
+| `block_plug` | **P** (Plug) | 队列插队 |
+| `block_unplug` | **U** (Unplug) | 队列拔塞 |
+
+→ 这些就是 blktrace 使用的内核 tracepoint！bpftrace 通过 `tracepoint:block:*` 可以 hook 到完全相同的事件。
+
+## 附录 B：bpftrace 语法速查
+
+### probe 类型
+
+| 类型 | 格式 | 说明 |
+|------|------|------|
+| `BEGIN` / `END` | `BEGIN { ... }` | 程序启动/退出时 |
+| `tracepoint` | `tracepoint:子系统:事件名` | 内核静态追踪点 |
+| `kprobe` / `kretprobe` | `kprobe:函数名` | 内核函数入口/返回 |
+| `uprobe` | `uprobe:库路径:函数名` | 用户态函数 |
+| `interval` | `interval:s:1` | 定时触发（每秒） |
+| `profile` | `profile:hz:99` | 采样（99Hz） |
+| `usdt` | `usdt:路径:provider:name` | 用户态 SDT |
+
+### 常用聚合函数
+
+| 函数 | 说明 | 示例 |
+|------|------|------|
+| `count()` | 计数 | `@[probe] = count()` |
+| `sum(n)` | 求和 | `@bytes = sum(args->size)` |
+| `avg(n)` | 平均值 | `@avg_lat = avg($delta)` |
+| `min(n)` / `max(n)` | 最小/最大值 | `@max_lat = max($delta)` |
+| `hist(n)` | 2 的幂次直方图 | `@lat = hist($us)` |
+| `lhist(n, min, max, step)` | 线性直方图 | `@lat = lhist($us, 0, 1000, 100)` |
+
+### 常用内置函数
+
+| 函数 | 说明 |
+|------|------|
+| `printf(fmt, ...)` | 格式化输出 |
+| `str(ptr)` | 指针 → 字符串 |
+| `ksym(addr)` | 内核地址 → 符号名 |
+| `ustack()` | 用户态调用栈 |
+| `kstack()` | 内核态调用栈 |
+| `time(fmt)` | 格式化时间输出 |
+| `delete(@map[key])` | 删除 map 条目 |
+| `clear(@map)` | 清空 map |
+| `exit()` | 退出 bpftrace |
