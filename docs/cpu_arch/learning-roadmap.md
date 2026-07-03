@@ -29,6 +29,9 @@
   - [Step 4: CPU 拓扑与负载均衡](#step-4-cpu-拓扑与负载均衡)
   - [Step 5: cpufreq / cpuidle 子系统](#step-5-cpufreq--cpuidle-子系统)
   - [Step 6: CPU 相关命令与调优](#step-6-cpu-相关命令与调优)
+  - [Step 7: AMD 微架构专题](#step-7-amd-微架构专题)
+  - [Step 8: L3 Cache Miss 专题分析](#step-8-l3-cache-miss-专题分析)
+  - [Step 9: 自旋锁性能分析](#step-9-自旋锁性能分析)
 - [6. 与性能工具的关系](#6-与性能工具的关系)
 - [7. 动手实验清单](#7-动手实验清单)
 - [8. 关键源码文件索引](#8-关键源码文件索引)
@@ -561,6 +564,49 @@ struct rq {
 - perf stat 收集硬件计数器数据
 - /proc/cpuinfo / /proc/schedstat 解读
 
+### Step 7: AMD 微架构专题
+
+**目标：** 掌握 AMD Zen 3/4/5 的独特拓扑结构及其对性能的影响
+
+**文件位置：**
+- `reading/05_amd_microarchitecture.md`
+
+**阅读要点：**
+- CCD（Core Complex Die）和 CCX（Core Complex Chiplet）拓扑
+- ★ 8 核共享 32MB L3 Cache 的含义与性能影响
+- NPS（Node Per Socket）配置（NPS1/NPS2/NPS4）
+- AMD vs Intel 的关键差异（Infinity Fabric、L3 结构、内存控制器位置）
+- AMD IBS（Instruction Based Sampling）的使用方法
+
+### Step 8: L3 Cache Miss 专题分析
+
+**目标：** 掌握 L3 Cache Miss 的测量、因果链分析和诊断工具
+
+**文件位置：**
+- `reading/06_l3_cache_miss_analysis.md`
+
+**阅读要点：**
+- 用 perf 测量 L3 cache miss 率（`perf stat -e cache-misses,cache-references`）
+- ★ 因果链 A：L3 Miss → 内存带宽瓶颈 → CPU 等待 → 高 %system 低吞吐
+- ★ 因果链 B：CPU 抢占 → 上下文切换 → TLB flush → cache pollution → miss 升高
+- ★ 如何区分两种因果关系（对照实验 + 时域分析 + perf c2c）
+- perf c2c：Cache-to-Cache 分析（识别伪共享和缓存行竞争）
+- perf mem：内存访问采样（延迟分布和热点定位）
+
+### Step 9: 自旋锁性能分析
+
+**目标：** 识别和定位内核自旋锁竞争热点
+
+**文件位置：**
+- `reading/07_spinlock_analysis.md`
+
+**阅读要点：**
+- spinlock 在高竞争下的表现（IPC 低、%sys 高、吞吐量低）
+- ★ ticket spinlock vs queued spinlock 的架构差异
+- 如何识别 spinlock 热点（`perf record -e cycles:pp` + 看 `_raw_spin_lock` 占比）
+- perf lock：锁竞争分析工具
+- bpftrace 追踪自旋锁等待时间分布
+
 ---
 
 ## 6. 与性能工具的关系
@@ -732,6 +778,64 @@ numactl --cpunodebind=0 --membind=1 stream_benchmark
 perf stat -e cache-misses,numa-interleave ...
 ```
 
+### 实验 7：AMD CCD 拓扑与 L3 共享验证（AMD 专用）
+
+```bash
+# 查看 CCD 拓扑
+lscpu -e
+cat /sys/devices/system/cpu/cpu*/topology/core_siblings_list
+
+# 对比同 CCD vs 跨 CCD 的 L3 miss 率
+# 同 CCD（假设 CCD0 = CPU 0-7）
+perf stat -e LLC-load-misses -- taskset -c 0-7 ./program
+
+# 跨 CCD（每 CCD 取一个核）
+perf stat -e LLC-load-misses -- taskset -c 0,8,16,24,32,40,48,56 ./program
+```
+
+### 实验 8：L3 Cache Miss 因果链诊断
+
+```bash
+# Step 1: 基本 L3 miss 率
+perf stat -e cache-references,cache-misses,instructions -- ./program
+
+# Step 2: 检查上下文切换（排除抢占因素）
+vmstat 1 10
+
+# Step 3: 绑定 CPU 对照实验
+perf stat -e cache-misses,cache-references -- taskset -c 0-7 ./program
+perf stat -e cache-misses,cache-references -- ./program  # 不绑定
+
+# Step 4: perf mem 看延迟分布
+perf mem record -- ./program
+perf mem report --sort=mem
+
+# Step 5: perf c2c 看多核竞争
+perf c2c record -- ./program
+perf c2c report
+```
+
+### 实验 9：自旋锁竞争定位
+
+```bash
+# Step 1: perf record 看热点函数
+perf record -e cycles:pp -g -- ./program
+perf report --stdio --sort=symbol
+# 关注 _raw_spin_lock / queued_spin_lock_slowpath 占比
+
+# Step 2: perf lock 看锁统计
+perf lock record -- ./program
+perf lock report --sort=wait
+
+# Step 3: bpftrace 追踪锁等待时间
+bpftrace -e '
+kprobe:queued_spin_lock_slowpath { @start[tid] = nsecs; }
+kretprobe:queued_spin_lock_slowpath /@start[tid]/ {
+    @wait_ns = hist(nsecs - @start[tid]);
+    delete(@start[tid]);
+}'
+```
+
 ---
 
 ## 8. 关键源码文件索引
@@ -758,3 +862,6 @@ perf stat -e cache-misses,numa-interleave ...
 | PELT 负载追踪 | `src/linux-5.10/kernel/sched/pelt.c` |
 | perf_event 子系统 | `src/linux-5.10/kernel/events/core.c` |
 | CPU 拓扑 sysfs | `src/linux-5.10/drivers/base/topology.c` |
+| Queued Spinlock | `src/linux-5.10/kernel/locking/qspinlock.c` |
+| spinlock 头文件 | `src/linux-5.10/include/linux/spinlock.h` |
+| 锁统计 | `/proc/lock_stat`（需 `CONFIG_LOCK_STAT=y`） |

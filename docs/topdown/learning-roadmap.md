@@ -9,7 +9,7 @@
 - [1. 方法论概览](#1-方法论概览)
 - [2. 四级层次模型](#2-四级层次模型)
 - [3. 核心概念](#3-核心概念)
-- [4. 学习路线（6 步）](#4-学习路线6-步)
+- [4. 学习路线（8 步）](#4-学习路线8-步)
 - [5. 工具链](#5-工具链)
 - [6. 实战实验清单](#6-实战实验清单)
 - [7. 关键文件索引](#7-关键文件索引)
@@ -224,7 +224,7 @@ IPC = Instructions_Retired / CPU_CLK_UNHALTED.THREAD
 
 ---
 
-## 4. 学习路线（6 步）
+## 4. 学习路线（8 步）
 
 ### Step 1：CPU 流水线基础
 
@@ -356,6 +356,62 @@ gcc -O2 -o matmul_blocked matmul_blocked.c
 perf stat --topdown --td-level 2 -- ./matmul_naive
 perf stat --topdown --td-level 2 -- ./matmul_blocked
 ```
+
+---
+
+### Step 7：AMD 上的 Top-Down 分析
+
+**目标：** 掌握在 AMD 平台上进行等效的 Top-Down 瓶颈分析
+
+**文件位置：** `reading/04_amd_topdown.md`
+
+**阅读要点：**
+
+```
+1. 为什么 AMD 没有 perf stat --topdown（Intel 特有 PMU 事件）
+2. AMD 替代方案: stalled-cycles-frontend/backend 近似 Level 1
+3. 用 perf stat -d 的 cache/branch 指标推断瓶颈类型
+4. AMD IBS（Instruction Based Sampling）精确采样
+5. AMD μProf 官方分析工具
+```
+
+**思考题：**
+
+1. AMD 的 `stalled-cycles-backend` 和 Intel 的 `Backend Bound` 有何差异？
+   > 答：Intel Backend Bound 用精确的 PMU 事件（UOPS_ISSUED.ANY）计算，区分 Memory Bound 和 Core Bound。AMD 的 stalled-cycles-backend 是一个笼统的"后端停顿周期"指标，不能直接区分 Memory vs Core Bound，需要结合 L3 miss 率来推断。
+
+2. AMD IBS 比 Intel PEBS 多提供什么信息？
+   > 答：IBS Op 模式提供每条采样指令的 DC miss latency（缓存缺失的实际延迟周期数），这在 Intel PEBS 中不是每条指令都有的。可以直接看到哪些内存访问导致了长时间等待。
+
+**实操任务：** 在 AMD 服务器上运行 `perf stat -e stalled-cycles-frontend,stalled-cycles-backend,LLC-loads,LLC-load-misses -- ./program` 并进行瓶颈推断。
+
+---
+
+### Step 8：实战 — CPU 高占用低吞吐的 Top-Down 诊断
+
+**目标：** 掌握端到端的 Top-Down 诊断流程（5 步法）
+
+**文件位置：** `reading/05_high_cpu_low_throughput.md`
+
+**阅读要点：**
+
+```
+1. Step 1: perf stat 看 IPC → IPC < 1.0 说明有大量 stall
+2. Step 2: 看 Frontend Bound vs Backend Bound
+3. Step 3: Backend Bound 看 Memory Bound vs Core Bound
+4. Step 4: Memory Bound 看 L1/L2/L3 miss 率
+5. Step 5: 结合 numactl 看跨 NUMA 访问比例
+```
+
+**思考题：**
+
+1. 如果 IPC = 0.3 但 L3 miss 率只有 5%，瓶颈最可能在哪？
+   > 答：Core Bound — 执行单元瓶颈或长依赖链。可能的原因包括：大量除法运算、串行依赖链（如链表遍历的 pointer chasing）、或自旋锁等待。
+
+2. 在 AMD 上如果 Backend Bound 高，如何区分 Memory Bound 和 Core Bound？
+   > 答：结合 L3 miss 率判断。如果 L3 miss 率 > 30%，说明大量 DRAM 访问 → Memory Bound。如果 L3 miss 率 < 10% 但 Backend stall 仍然高 → Core Bound。更精确的方法是使用 AMD IBS 查看每条指令的 DC miss latency。
+
+**实操任务：** 对一个已知瓶颈的程序执行完整的 5 步诊断流程，记录每步的命令、指标和判断结论。
 
 ---
 
@@ -539,6 +595,8 @@ perf stat --topdown --td-level 2 -- /tmp/matmul_O3
 | `reading/01_pipeline_slots.md` | CPU 流水线模型与 Pipeline Slot 概念 | ★ Step 1 |
 | `reading/02_command_reference.md` | perf stat --topdown 参数详解 | ★ Step 2 |
 | `reading/03_command_output_demo.md` | 真实输出实战解析 | ★ Step 3 |
+| `reading/04_amd_topdown.md` | AMD 上的 Top-Down 替代分析方法 | ★ Step 7 |
+| `reading/05_high_cpu_low_throughput.md` | CPU 高占用低吞吐的 5 步诊断法 | ★ Step 8 |
 | `QA.md` | 问答集（持续追加） | 按需查阅 |
 
 ---
@@ -547,7 +605,11 @@ perf stat --topdown --td-level 2 -- /tmp/matmul_O3
 
 - **原始论文：** Ahmad Yasin, "A Top-Down Method for Performance Analysis and Counters Architecture", ISPASS 2014
 - **Intel 官方文档：** [Top-Down Microarchitecture Analysis Method](https://www.intel.com/content/www/us/en/docs/vtune-profiler/user-guide/2024-0/top-down-microarchitecture-analysis-method.html)
+- **AMD μProf：** [AMD Microarchitecture Profiler](https://www.amd.com/en/developer/uprof.html)
+- **AMD PPR：** [Processor Programming Reference](https://www.amd.com/en/search/documentation/hub.html) — AMD PMU 事件定义
 - **pmu-tools：** [github.com/andikleen/pmu-tools](https://github.com/andikleen/pmu-tools)
 - **Brendan Gregg：** [CPU Flame Graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html)
+- **Brendan Gregg：** Systems Performance, 2nd Edition — Chapter 6 (CPUs)
 - **Intel 64 and IA-32 Architectures Optimization Reference Manual** — Chapter 2 (Microarchitecture)
+- **Agner Fog：** [Microarchitecture of AMD and Intel x86 CPUs](https://agner.org/optimize/microarchitecture.pdf)
 - **perf 源码：** `src/linux-5.10/tools/perf/` — 包含 topdown metric 定义

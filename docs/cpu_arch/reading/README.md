@@ -1,7 +1,7 @@
 # CPU 架构与内核 CPU 子系统 源码阅读指南
 
 > 本目录包含 CPU 微架构、内核调度器、cpufreq/cpuidle 子系统的阅读材料。
-> 按 Step 1 → 4 的顺序阅读，每个文件都带有详细中文注释。
+> 按 Step 1 → 9 的顺序阅读，每个文件都带有详细中文注释。
 
 ## 阅读路线
 
@@ -11,6 +11,9 @@
 | **2** | 02_kernel_cpu_scheduler.md | 内核 `kernel/sched/` + `include/linux/sched.h` | task_struct、sched_entity、rq、cfs_rq、CFS 红黑树、vruntime |
 | **3** | 03_command_reference.md | 系统文档 + man pages | lscpu / taskset / numactl / cpupower / /proc/cpuinfo 解读 |
 | **4** | 04_command_output_demo.md | 实际命令执行输出 | 真实输出 + 逐行注解，包含 lscpu、schedstat、perf stat 等 |
+| **5** | 05_amd_microarchitecture.md | AMD PPR + 优化指南 | ★ AMD CCD/CCX 拓扑、8核共享L3、NPS配置、AMD vs Intel |
+| **6** | 06_l3_cache_miss_analysis.md | perf 文档 + 实践整理 | ★ L3 miss 测量、两种因果链、perf c2c/mem、诊断流程 |
+| **7** | 07_spinlock_analysis.md | 内核源码 + perf/bpftrace | ★ ticket vs queued spinlock、perf lock、bpftrace 追踪 |
 
 ## 阅读建议
 
@@ -18,10 +21,13 @@
 2. **Step 2 是核心**：内核调度器决定任务在哪个 CPU 上何时运行，直接影响程序性能
 3. **Step 3 掌握工具**：lscpu、taskset、numactl 是日常调优必备命令
 4. **Step 4 对照实践**：真实命令输出 + 逐行注解，加深理解
+5. **Step 5 AMD 专题**：如果使用 AMD 服务器，必读 — CCD 拓扑和 L3 共享对性能影响巨大
+6. **Step 6 L3 Miss 专题**：性能工程师最常遇到的瓶颈类型，两种因果链的区分方法
+7. **Step 7 自旋锁专题**：高竞争场景下的内核锁问题定位
 
 ## 文件说明
 
-- 概念文件（Step 1）：综合多源整理，用 ASCII 图表 + 表格展示
+- 概念文件（Step 1、5、6、7）：综合多源整理，用 ASCII 图表 + 表格展示
 - 源码文件（Step 2）：从 `src/linux-5.10/` 提取关键结构体和函数，逐字段注释
 - 参考文件（Step 3）：命令用法速查手册
 - 实战文件（Step 4）：真实执行输出 + 逐行注解
