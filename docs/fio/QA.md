@@ -17,6 +17,7 @@
 - [Q9: io_u 空闲池（io_u_freelist）的个数就是 iodepth 参数吗？](#q9-io_u-空闲池io_u_freelist的个数就是-iodepth-参数吗)
 - [Q10: get_next_offset 中 offset 为什么不能大于 io_size？](#q10-get_next_offset-中-offset-为什么不能大于-io_size)
 - [Q11: fio 中的"文件"是什么含义？能否直接对裸设备读写？](#q11-fio-中的文件是什么含义能否直接对裸设备读写)
+- [Q12: sync 引擎的 .prep 何时调用？能否通过多 job/多 qd 实现并发？](#q12-sync-引擎的-prep-何时调用能否通过多-job多-qd-实现并发)
 
 ---
 
@@ -1001,6 +1002,109 @@ fio --filename=/dev/vdb --offset=1G --size=1G
 | 裸设备 | fio → block layer → 设备 | ★ 纯设备性能（无 FS 开销） |
 
 **一句话总结：** fio 的"文件"包含块设备。用 `--filename=/dev/vdb` 直接读写裸设备，绕过文件系统，测得纯存储性能。这是测试存储硬件最准确的方式。
+
+---
+
+## Q12: sync 引擎的 .prep 何时调用？能否通过多 job/多 qd 实现并发？
+
+**日期：** 2026-07-04  
+**场景：** 阅读 `06_engine_sync.c` 中 `.prep = fio_syncio_prep` 不理解调用时机，以及 sync 引擎的并发能力  
+**相关文件：** `docs/fio/reading/06_engine_sync.c`  
+**源码位置：** `src/fio/ioengines.c:271` — `td_io_prep()`；`src/fio/backend.c:2137`
+
+### 回答
+
+**.prep 在每个 io_u 提交（queue）前调用。sync 引擎可以通过 `--numjobs` 实现并发（多进程），但不能通过 `--iodepth` 实现并发（fio 会强制 qd=1）。**
+
+#### .prep 的调用时机
+
+```c
+// ioengines.c:271
+int td_io_prep(struct thread_data *td, struct io_u *io_u)
+{
+    if (td->io_ops->prep)
+        return td->io_ops->prep(td, io_u);  // ★ 调用引擎的 prep
+}
+
+// backend.c:248 — 主循环中的顺序
+td_io_prep(td, io_u);     // ★ 1. prep（准备）
+td_io_queue(td, io_u);    //    2. queue（提交执行）
+```
+
+sync 引擎的 prep 做 lseek 定位：
+
+```c
+// sync.c:92
+static int fio_syncio_prep(...)
+{
+    if (LAST_POS(f) == io_u->offset)
+        return 0;                    // ★ 连续 I/O 跳过 lseek（优化）
+    lseek(f->fd, io_u->offset, SEEK_SET);  // 否则 lseek 定位
+}
+```
+
+→ prep 在 queue 前准备 I/O。sync 用 read/write（不带偏移），需先 lseek；psync 用 pread/pwrite（自带偏移），不需要 prep。
+
+#### sync 引擎 + iodepth 的限制
+
+```c
+// backend.c:2137 — fio 启动时的警告！
+if (FIO_SYNCIO && iodepth > 1 && io_submit_mode != IO_MODE_OFFLOAD) {
+    log_info("note: both iodepth >= 1 and synchronous I/O engine "
+             "are selected, queue depth will be capped at 1");
+    //              ★ iodepth 被强制限制为 1！
+}
+```
+
+**原因：sync 的 queue() 返回 FIO_Q_COMPLETED（阻塞完成）**
+
+```c
+// sync.c:220 — fio_syncio_queue()
+ret = write(f->fd, ...);        // ★ 阻塞直到完成
+return FIO_Q_COMPLETED;         // 直接返回"已完成"
+
+// 对比 libaio：
+io_submit(...);                 // 立即返回
+return FIO_Q_QUEUED;            // 返回"已入队"，可继续提交
+```
+
+#### 三种并发方式对比
+
+| 方式 | 机制 | sync 引擎 | libaio 引擎 |
+|------|------|----------|------------|
+| `--iodepth=32` | 单 job 多在飞 I/O | ✗ 无效（qd 被强制=1） | ★ 有效 |
+| `--numjobs=4` | 多进程各自独立 I/O | ★ 有效 | ★ 有效 |
+| `--iodepth=32 --numjobs=4` | 组合 | qd=1×4=4 并发 | ★ 32×4=128 并发 |
+
+```
+sync + numjobs=4：
+  Job1: write()阻塞  ├─ Job2: write()阻塞
+                     ├─ Job3: write()阻塞
+                     └─ Job4: write()阻塞
+  → 4 个并发 I/O（每个 qd=1）
+
+libaio + iodepth=32 + numjobs=4：
+  Job1: 32个异步在飞  ├─ Job2: 32个异步在飞
+                      ├─ Job3: 32个异步在飞
+                      └─ Job4: 32个异步在飞
+  → 128 个并发 I/O
+```
+
+#### 实际测试
+
+```bash
+# sync + iodepth=32 → 警告，实际 qd=1
+fio --ioengine=sync --iodepth=32 --filename=/dev/vdb
+# 输出：queue depth will be capped at 1
+
+# ★ sync + numjobs=4 → 4 并发（有效）
+fio --ioengine=sync --numjobs=4 --filename=/dev/vdb
+
+# libaio + iodepth=32 → 32 并发（有效）
+fio --ioengine=libaio --iodepth=32 --direct=1 --filename=/dev/vdb
+```
+
+**一句话总结：** `.prep` 在 queue 前调用（sync 做 lseek）。sync 引擎用 `--numjobs` 实现并发（多进程），不能用 `--iodepth`（queue 阻塞返回 COMPLETED，fio 强制 qd=1）。
 
 ---
 
