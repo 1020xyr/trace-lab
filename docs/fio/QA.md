@@ -16,6 +16,7 @@
 - [Q8: 为什么 fio 用 libaio 引擎时必须加 --direct=1？](#q8-为什么-fio-用-libaio-引擎时必须加---direct1)
 - [Q9: io_u 空闲池（io_u_freelist）的个数就是 iodepth 参数吗？](#q9-io_u-空闲池io_u_freelist的个数就是-iodepth-参数吗)
 - [Q10: get_next_offset 中 offset 为什么不能大于 io_size？](#q10-get_next_offset-中-offset-为什么不能大于-io_size)
+- [Q11: fio 中的"文件"是什么含义？能否直接对裸设备读写？](#q11-fio-中的文件是什么含义能否直接对裸设备读写)
 
 ---
 
@@ -905,6 +906,101 @@ if (f->io_size > f->real_file_size)
 ```
 
 **一句话总结：** `io_size` 是 I/O 工作区域大小，offset 是相对偏移。检查 `offset >= io_size` 防止随机/顺序生成器产生越界值，确保 I/O 只落在用户指定的测试区域内。
+
+---
+
+## Q11: fio 中的"文件"是什么含义？能否直接对裸设备读写？
+
+**日期：** 2026-07-04  
+**场景：** 不理解 fio 中 file/file_offset/io_size 的含义，疑惑是否经过文件系统  
+**相关文件：** `docs/fio/reading/05_io_u_get.c`  
+**源码位置：** `src/fio/file.h:20` — `enum fio_filetype`；`src/fio/filesetup.c:1720` — `get_file_type()`
+
+### 回答
+
+**fio 的"文件"是广义概念，支持普通文件、块设备、字符设备、管道。用 `--filename=/dev/vdb` 可以直接读写裸设备，完全绕过文件系统。**
+
+#### 四种文件类型
+
+```c
+// file.h:20
+enum fio_filetype {
+    FIO_TYPE_FILE = 1,   /* 普通文件（经过文件系统） */
+    FIO_TYPE_BLOCK,      /* ★ 块设备（裸设备，如 /dev/sdb） */
+    FIO_TYPE_CHAR,       /* 字符设备（如 /dev/null） */
+    FIO_TYPE_PIPE,       /* 管道（stdin "-"） */
+};
+```
+
+#### 类型判断（get_file_type）
+
+```c
+// filesetup.c:1720
+static void get_file_type(struct fio_file *f)
+{
+    struct stat sb;
+    f->filetype = FIO_TYPE_FILE;  // 默认
+
+    if (!stat(f->file_name, &sb)) {
+        if (S_ISBLK(sb.st_mode))       // ★ 块设备
+            f->filetype = FIO_TYPE_BLOCK;
+        else if (S_ISCHR(sb.st_mode))  // 字符设备
+            f->filetype = FIO_TYPE_CHAR;
+        else if (S_ISFIFO(sb.st_mode)) // 管道
+            f->filetype = FIO_TYPE_PIPE;
+    }
+}
+```
+
+#### 裸设备 vs 普通文件
+
+```
+普通文件 --filename=/tmp/testfile：
+  open() → VFS → ext4 → block layer → 设备
+  ★ 经过文件系统（inode/dentry/page cache/journal）
+
+裸设备 --filename=/dev/vdb：
+  open() → block layer → 设备
+  ★★★ 完全绕过文件系统，直接按扇区读写
+```
+
+#### 块设备的特殊处理
+
+```c
+// filesetup.c:951 — 设备大小用 ioctl 获取，不用 stat
+if (f->filetype == FIO_TYPE_BLOCK || f->filetype == FIO_TYPE_CHAR) {
+    ret += f->real_file_size;  // continue，跳过文件系统检查
+}
+
+// filesetup.c:745 — 块设备不需要创建文件
+if (f->filetype != FIO_TYPE_FILE)
+    return 0;
+
+// filesetup.c:1325 — 块设备不能 truncate（大小固定）
+if (f->filetype == FIO_TYPE_FILE && ...)
+```
+
+#### 实际使用
+
+```bash
+# 1. 普通文件（经过 ext4）
+fio --filename=/tmp/testfile --size=1G --ioengine=libaio --direct=1
+
+# 2. ★ 裸设备（绕过文件系统）
+fio --filename=/dev/vdb --ioengine=libaio --direct=1 --size=1G --offset=0
+
+# 3. 裸设备 + 跳过前 1GB（保护分区表）
+fio --filename=/dev/vdb --offset=1G --size=1G
+```
+
+#### 为什么裸设备测试更准确？
+
+| 方式 | 路径 | 测的是什么 |
+|------|------|----------|
+| 普通文件 | fio → ext4 → block layer → 设备 | 文件系统 + 设备综合性能 |
+| 裸设备 | fio → block layer → 设备 | ★ 纯设备性能（无 FS 开销） |
+
+**一句话总结：** fio 的"文件"包含块设备。用 `--filename=/dev/vdb` 直接读写裸设备，绕过文件系统，测得纯存储性能。这是测试存储硬件最准确的方式。
 
 ---
 
