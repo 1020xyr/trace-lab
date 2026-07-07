@@ -14,6 +14,7 @@
 - [Q6: fio 的 slat/clat 与 blktrace 的 Q2D/D2C 是什么关系？](#q6-fio-的-slatclat-与-blktrace-的-q2dd2c-是什么关系)
 - [Q7: fio 的 --numjobs 和 --iodepth 有什么区别？对 IOPS 的影响是什么？](#q7-fio-的---numjobs-和---iodepth-有什么区别对-iops-的影响是什么)
 - [Q8: 为什么 fio 用 libaio 引擎时必须加 --direct=1？](#q8-为什么-fio-用-libaio-引擎时必须加---direct1)
+- [Q9: io_u 空闲池（io_u_freelist）的个数就是 iodepth 参数吗？](#q9-io_u-空闲池io_u_freelist的个数就是-iodepth-参数吗)
 
 ---
 
@@ -744,6 +745,80 @@ fio --ioengine=sync --iodepth=1 ...
 | **posixaio** | ★ 真正异步 | ⚠️ 可能同步 | 推荐加 direct=1 |
 
 **一句话总结：** Linux AIO（libaio）的设计只保证 O_DIRECT 路径下的真正异步。不加 `direct=1` 时，内核在 `io_submit()` 中同步完成 I/O，iodepth 形同虚设。这是内核 `generic_file_read_iter()` 的代码逻辑决定的，不是 fio 的 bug。
+
+---
+
+## Q9: io_u 空闲池（io_u_freelist）的个数就是 iodepth 参数吗？
+
+**日期：** 2026-07-04  
+**场景：** 阅读 `04_backend_do_io.c` 中 get_io_u 从空闲池弹出 io_u 的描述，想确认池大小与 iodepth 的关系  
+**相关文件：** `docs/fio/reading/04_backend_do_io.c`  
+**源码位置：** `src/fio/backend.c:1507` — `init_io_u()` 函数
+
+### 回答
+
+**是的，io_u 空闲池的容量 = iodepth。** fio 在启动时预分配 `iodepth` 个 io_u 结构体，全部放入 `io_u_freelist`。
+
+#### 源码证据
+
+```c
+// backend.c:1507 — init_io_u()
+static int init_io_u(struct thread_data *td)
+{
+    // ★ 1. 创建三个队列，容量都是 td->o.iodepth
+    err += !io_u_rinit(&td->io_u_requeues, td->o.iodepth);           // 重排队列
+    err += !io_u_qinit(&td->io_u_freelist, td->o.iodepth, false);   // ★ 空闲池
+    err += !io_u_qinit(&td->io_u_all, td->o.iodepth, ...);          // 全部 io_u
+
+    // ★ 2. 循环 iodepth 次，每次分配一个 io_u
+    for (i = 0; i < td->o.iodepth; i++) {                           // ← 上限 = iodepth
+        io_u = fio_memalign(cl_align, sizeof(*io_u), ...);          // 分配内存
+        io_u->flags = IO_U_F_FREE;                                  // 标记为空闲
+        io_u_qpush(&td->io_u_freelist, io_u);                       // ★ 推入空闲池
+    }
+}
+```
+
+#### 三个队列的关系
+
+| 队列 | 容量 | 实际元素数 | 用途 |
+|------|------|----------|------|
+| `io_u_freelist` | iodepth | 0 ~ iodepth（动态） | ★ 空闲池，get_io_u 从这里取 |
+| `io_u_all` | iodepth | 始终 = iodepth | 所有 io_u（含在飞的），用于遍历 |
+| `io_u_requeues` | iodepth | 0 ~ iodepth | 需要重新提交的 io_u（部分完成等） |
+
+三者容量都是 `iodepth`，但只有 `io_u_freelist` 的实际元素数会随 `cur_depth` 变化。
+
+#### 运行时机制
+
+```
+iodepth = 32
+
+启动:  init_io_u() 分配 32 个 io_u → 全部放入 freelist
+       freelist=[32个]  cur_depth=0
+
+运行:  get_io_u() 弹出 1 个 → freelist=[31个]  cur_depth=1
+       ...重复...
+       get_io_u() 弹出 1 个 → freelist=[0个]   cur_depth=32  ← 满了！
+       
+       queue_full() = freelist为空 → wait_for_completions()
+       收割 1 个 → put_io_u() 归还 → freelist=[1个]  cur_depth=31
+       继续提交...
+```
+
+#### queue_full() 的判断依据
+
+```c
+// io_u.c:1745
+bool queue_full(const struct thread_data *td)
+{
+    return io_u_qempty(&td->io_u_freelist);  // ★ 空闲池为空 = 满
+}
+```
+
+fio 不直接比较 `cur_depth == iodepth`，而是检查**空闲池是否为空**。因为池大小 = iodepth，所以池空等价于在飞数达到上限。
+
+**一句话总结：** `init_io_u()` 在启动时预分配 `iodepth` 个 io_u 放入空闲池，运行时从池中取出/归还。池的容量就是 iodepth，这是 fio 控制并发 I/O 数的物理基础。
 
 ---
 
