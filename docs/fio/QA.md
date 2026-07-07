@@ -15,6 +15,7 @@
 - [Q7: fio 的 --numjobs 和 --iodepth 有什么区别？对 IOPS 的影响是什么？](#q7-fio-的---numjobs-和---iodepth-有什么区别对-iops-的影响是什么)
 - [Q8: 为什么 fio 用 libaio 引擎时必须加 --direct=1？](#q8-为什么-fio-用-libaio-引擎时必须加---direct1)
 - [Q9: io_u 空闲池（io_u_freelist）的个数就是 iodepth 参数吗？](#q9-io_u-空闲池io_u_freelist的个数就是-iodepth-参数吗)
+- [Q10: get_next_offset 中 offset 为什么不能大于 io_size？](#q10-get_next_offset-中-offset-为什么不能大于-io_size)
 
 ---
 
@@ -819,6 +820,91 @@ bool queue_full(const struct thread_data *td)
 fio 不直接比较 `cur_depth == iodepth`，而是检查**空闲池是否为空**。因为池大小 = iodepth，所以池空等价于在飞数达到上限。
 
 **一句话总结：** `init_io_u()` 在启动时预分配 `iodepth` 个 io_u 放入空闲池，运行时从池中取出/归还。池的容量就是 iodepth，这是 fio 控制并发 I/O 数的物理基础。
+
+---
+
+## Q10: get_next_offset 中 offset 为什么不能大于 io_size？
+
+**日期：** 2026-07-04  
+**场景：** 阅读 `05_io_u_get.c` 中 get_next_offset() 的边界检查不理解  
+**相关文件：** `docs/fio/reading/05_io_u_get.c`  
+**源码位置：** `src/fio/io_u.c:553` — `get_next_offset()`；`src/fio/filesetup.c:1236`
+
+### 回答
+
+**io_size 是 fio 的"I/O 工作区域大小"（由 --size 参数控制），offset 是相对该区域的偏移，必须 < io_size，否则 I/O 会落到测试区域外。**
+
+#### 三个文件大小概念
+
+```
+文件在磁盘上的布局：
+
+  ┌──────────────────────────────────────────────┐
+  │  file_offset    │← io_size →│                │
+  │  (起始偏移)       │  I/O 区域  │                │
+  │                  │           │                │
+  0                  ↑           ↑                ↑
+                  file_offset   file_offset      real_file_size
+                                  +io_size
+
+  file_offset    = I/O 区域起始位置（--offset 参数，默认 0）
+  io_size        = I/O 区域大小（--size 参数）
+  real_file_size = 文件在磁盘上的实际大小
+```
+
+#### 两层边界检查
+
+```c
+// io_u.c:553 — get_next_offset()
+static int get_next_offset(struct thread_data *td, struct io_u *io_u, ...)
+{
+    // get_next_block() 生成"相对偏移"（应在 [0, io_size) 范围内）
+    if (get_next_block(td, io_u, ddir, ...))
+        return 1;
+
+    // ★ 检查 1：相对偏移不能超过 io_size
+    if (io_u->offset >= f->io_size) {
+        return 1;  // 越界，重新生成
+    }
+
+    // 相对偏移 → 绝对偏移（加上 file_offset）
+    io_u->offset += f->file_offset;
+
+    // ★ 检查 2：绝对偏移不能超过 real_file_size
+    if (io_u->offset >= f->real_file_size) {
+        return 1;  // 越界，重新生成
+    }
+}
+```
+
+#### 为什么 offset 不能大于 io_size？
+
+| I/O 模式 | offset 生成方式 | 超过 io_size 的含义 |
+|---------|----------------|-------------------|
+| **随机 I/O** | 随机数 ∈ [0, io_size) | 生成器越界 → I/O 写到测试区域外 |
+| **顺序 I/O** | 每次递增 bs | 已遍历完整个区域 → 需回绕或停止 |
+
+```
+示例：--size=100M --offset=1G
+  file_offset = 1G, io_size = 100M
+
+  正确：随机 offset ∈ [0, 100M) → 绝对位置 ∈ [1G, 1.1G)
+  错误：offset = 150M → 绝对位置 = 1.15G → 超出 I/O 区域！
+  → 返回 1，fio 重新生成 offset
+```
+
+#### io_size 的设置（filesetup.c:1236）
+
+```c
+// --size=100M 且 2 个文件 → 每个文件 io_size = 50M
+f->io_size = fs;  // size / nr_files
+
+// io_size 不能超过 real_file_size
+if (f->io_size > f->real_file_size)
+    f->io_size = f->real_file_size;
+```
+
+**一句话总结：** `io_size` 是 I/O 工作区域大小，offset 是相对偏移。检查 `offset >= io_size` 防止随机/顺序生成器产生越界值，确保 I/O 只落在用户指定的测试区域内。
 
 ---
 
