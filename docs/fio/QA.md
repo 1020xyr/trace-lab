@@ -23,6 +23,7 @@
 - [Q15: 如何用 IO depth 分布诊断瓶颈？](#q15-如何用-io-depth-分布诊断瓶颈)
 - [Q16: stonewall 的作用？如何设置 task 并行/串行？每个 task 能多 job 吗？](#q16-stonewall-的作用如何设置-task-并行串行每个-task-能多-job-吗)
 - [Q17: fio 的 slat/clat 与 blktrace 的 Q2D/D2C 真的对应吗？](#q17-fio-的-slatclat-与-blktrace-的-q2dd2c-真的对应吗)
+- [Q18: fio 回放（replay）机制详解？iodepth 在回放时如何工作？](#q18-fio-回放replay机制详解iodepth-在回放时如何工作)
 
 ---
 
@@ -1696,6 +1697,156 @@ btt 看不到的：
 ```
 
 **一句话总结：** blktrace 只看内核 block layer（Q→D→C），fio 还包含用户态 slat + io_submit/AIO/io_getevents 开销。fio slat ≠ Q2D（不同阶段），fio clat ≠ D2C（clat 远大于 D2C）。btt 从 clat 中拆出 Q2D/D2C，但看不到用户态和系统调用开销。
+
+---
+
+## Q18: fio 回放（replay）机制详解？iodepth 在回放时如何工作？
+
+**日期：** 2026-07-04  
+**场景：** 需要用 fio 回放 blktrace 录制的真实 I/O 模式  
+**相关文件：** `docs/fio/reading/10_command_reference.md`  
+**源码位置：** `src/fio/blktrace.c:313/155`、`src/fio/iolog.c:177/195`、`src/fio/options.c:3767`
+
+### 回答
+
+**fio 回放通过 `--read_iolog` 读取 blktrace 二进制文件，只取 Q 事件，精确复现 offset/大小/时间间隔。iodepth 是上限，默认原速回放时实际 QD 由 trace 间隔决定。**
+
+#### 回放数据流
+
+```
+blktrace 采集                  fio 回放
+──────────                    ────────
+blktrace -d /dev/sda -o trace  fio --read_iolog=trace.blktrace.0
+       │                              │
+       ▼                              ▼
+  blk_io_trace 二进制          read_blktrace()
+  (每条含 sector/bytes/time)         │
+       │                              ▼
+       │                     只取 Q 事件（__BLK_TA_QUEUE）
+       │                              │
+       │                              ▼
+       │                     创建 io_piece (ipo)
+       │                     ┌──────────────────────┐
+       │                     │ ipo->offset = sector*512 │
+       │                     │ ipo->len = bytes         │
+       │                     │ ipo->delay = ttime/1000  │
+       │                     │ ipo->ddir = READ/WRITE    │
+       │                     └──────────────────────┘
+       │                              │
+       │                              ▼
+       │                     放入 io_log_list 链表
+       │                              │
+       │                              ▼
+       │                     do_io() 从链表取 ipo
+       │                     get_io_u() → read_iolog_get()
+```
+
+#### 源码：只处理 Q 事件
+
+```c
+// blktrace.c:313 — queue_trace()
+if ((t->action & 0xffff) != __BLK_TA_QUEUE)  // ★ 只处理 Q 事件
+    return false;
+
+delay = delay_since_ttime(td, t->time);     // 计算与上一事件的时间差
+*last_ttime = t->time;
+```
+
+#### ipo 创建（blktrace.c:155）
+
+```c
+ipo->offset = offset * 512;                    // 扇区→字节
+if (td->o.replay_scale)                        // ★ 偏移缩放
+    ipo->offset = ipo->offset / td->o.replay_scale;
+ipo_bytes_align(td->o.replay_align, ipo);      // ★ 偏移对齐
+ipo->len = bytes;
+ipo->delay = ttime / 1000;                     // ★ 时间差（μs）
+```
+
+#### 时间控制参数
+
+```c
+// iolog.c:177 — delay_since_ttime()
+if (!*last_ttime || td->o.no_stall || time < *last_ttime)
+    return 0;                          // ★ no_stall=1 → 不延迟
+else if (td->o.replay_time_scale == 100)
+    return time - *last_ttime;         // ★ 默认原速
+scale = 100.0 / td->o.replay_time_scale;
+return (time - *last_ttime) * scale;   // ★ 按比例缩放
+```
+
+| 参数 | 默认 | 作用 |
+|------|------|------|
+| `replay_no_stall=1` | 0 | 不等待，全速回放 |
+| `replay_time_scale=50` | 100 | 50=2 倍速，200=0.5 倍速 |
+| `replay_scale=2` | 1 | offset /= 2（缩放到小设备） |
+| `replay_align=4096` | 0 | offset 对齐到 4K |
+| `replay_redirect=/dev/sdb` | 无 | 重定向到指定设备 |
+| `replay_skip=read` | 无 | 跳过指定 I/O 类型 |
+| `iodepth=N` | 1 | ★ 回放时最大并发度（上限） |
+
+#### ★ iodepth 在回放时的行为
+
+```
+模式 1：原速回放（默认 replay_no_stall=0）
+  trace 时间间隔被保留 → 实际 QD 由 trace 决定
+  如果原始间隔大（5ms），QD 可能只有 1
+  iodepth 只是上限保护
+  IO depths: 1=80%, 2=15%, 4=5%  ← 跟随原始模式
+
+模式 2：全速回放（replay_no_stall=1）
+  忽略时间间隔 → 尽快提交 → QD 打满 iodepth
+  IO depths: 32=99%  ← 持续打满
+```
+
+#### 回放 vs 正常测试
+
+```
+正常测试：
+  get_io_u() → 随机/顺序 offset 生成器（fio 算法决定）
+  → iodepth 决定并发度，QD 持续打满
+
+回放：
+  get_io_u() → read_iolog_get() → 从 io_log_list 取 ipo
+  → offset/len/ddir 由 trace 决定（精确复现）
+  → iodepth 只是上限
+  → 实际 QD 由 trace 时间间隔决定（除非 no_stall）
+```
+
+#### 实战示例
+
+```bash
+# 1. 精确复现原始性能
+fio --read_iolog=trace.blktrace.0 --filename=/dev/sdb \
+    --ioengine=libaio --direct=1 --iodepth=64
+
+# 2. 全速回放（测设备极限）
+fio --read_iolog=trace.blktrace.0 --replay_no_stall=1 \
+    --filename=/dev/sdb --ioengine=libaio --direct=1 --iodepth=32
+
+# 3. 2 倍速回放
+fio --read_iolog=trace.blktrace.0 --replay_time_scale=50 \
+    --filename=/dev/sdb --ioengine=libaio --direct=1 --iodepth=64
+
+# 4. 缩放到小设备
+fio --read_iolog=trace.blktrace.0 --replay_scale=2 --replay_align=4096 \
+    --filename=/dev/sdb --ioengine=libaio --direct=1
+
+# 5. 跳过写操作只回放读
+fio --read_iolog=trace.blktrace.0 --replay_skip=write \
+    --filename=/dev/sdb --ioengine=libaio --direct=1
+```
+
+#### 多文件合并回放
+
+```bash
+fio --read_iolog=trace1.blktrace.0 \
+    --merge_blktrace_file=merged.bin \
+    --merge_blktrace_scalars=50,50 \    # 每个 trace I/O 量缩放到 50%
+    --merge_blktrace_iters=1,1          # 每个 trace 回放 1 次
+```
+
+**一句话总结：** fio 回放只取 blktrace 的 Q 事件，为每个事件创建 ipo（offset/len/delay/ddir）。`replay_no_stall` 控制是否保留时间间隔，`replay_time_scale` 控制时间缩放，`replay_scale/align` 控制 offset 缩放对齐。iodepth 是回放时的并发上限——默认原速回放时实际 QD 由 trace 间隔决定，全速回放时打满 iodepth。
 
 ---
 
