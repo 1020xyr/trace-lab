@@ -19,6 +19,7 @@
 - [Q11: fio 中的"文件"是什么含义？能否直接对裸设备读写？](#q11-fio-中的文件是什么含义能否直接对裸设备读写)
 - [Q12: sync 引擎的 .prep 何时调用？能否通过多 job/多 qd 实现并发？](#q12-sync-引擎的-prep-何时调用能否通过多-job多-qd-实现并发)
 - [Q13: fio 的线程模式是什么？默认是什么？为什么 SPDK 需要 --thread？](#q13-fio-的线程模式是什么默认是什么为什么-spdk-需要---thread)
+- [Q14: 为什么 fio 默认进程模式？线程模式看起来没坏处](#q14-为什么-fio-默认进程模式线程模式看起来没坏处)
 
 ---
 
@@ -1211,6 +1212,109 @@ fio --ioengine=spdk_bdev --thread --filename=Bdev0 ...
 ```
 
 **一句话总结：** fio 默认进程模式（fork），`--thread` 切换线程模式。SPDK 依赖 TLS（线程局部存储），fork 不继承 TLS 初始化，所以必须用 `--thread`。
+
+---
+
+## Q14: 为什么 fio 默认进程模式？线程模式看起来没坏处
+
+**日期：** 2026-07-04  
+**场景：** 理解了线程/进程模式后，疑惑为什么默认用进程模式  
+**相关文件：** `docs/fio/reading/08_engine_spdk.md`  
+**源码位置：** `src/fio/init.c:651`、`src/fio/smalloc.c`、`src/fio/backend.c:1988`
+
+### 回答
+
+**不只是崩溃隔离。进程模式默认的原因：verify 内存隔离、PSHARED 共享内存架构、库线程安全性低要求、信号处理简单。**
+
+#### 原因 1：崩溃隔离
+
+```
+进程模式：Job1 崩溃 → 只影响 Job1，其他继续
+线程模式：Job1 线程崩溃 → 整个进程退出 → 所有结果丢失
+```
+
+#### 原因 2：★ verify 模式的内存损坏隔离（核心原因）
+
+```
+verify 模式验证数据完整性：
+  - 如果某 job buffer overflow 损坏了自己的内存
+  - 进程模式：只损坏自己，其他 job 验证不受影响
+  - 线程模式：损坏共享地址空间 → 其他 job 也出错 → 误报
+  ★ 这是 verify 测试选进程模式的核心原因
+```
+
+#### 原因 3：进程间共享互斥锁（源码证据）
+
+```c
+// init.c:651 — 进程模式是首选，线程模式是 fallback
+#ifndef CONFIG_PSHARED    // 不支持进程间共享互斥锁
+    if (!o->use_thread) {
+        log_info("fio: this platform does not support process shared "
+                 "mutexes, forcing use of threads.\n");
+        o->use_thread = 1;    // ★ 被迫用线程模式
+    }
+#endif
+```
+
+fio 用 PTHREAD_PROCESS_SHARED 实现跨进程同步：
+
+```c
+// backend.c:1988
+mutex_cond_init_pshared(&td->io_u_lock, &td->free_cond);
+//   ↑ pshared = 进程间共享，用 mmap(MAP_SHARED) + pthread_mutexattr_setpshared
+```
+
+#### 原因 4：smalloc 共享内存架构
+
+```c
+// smalloc.c — 共享内存分配器
+ptr = mmap(NULL, alloc_size, PROT_READ|PROT_WRITE,
+           OS_MAP_ANON | MAP_SHARED, -1, 0);
+//                              ↑ 进程间共享
+```
+
+```
+进程模式架构：
+  ┌─进程1─┐ ┌─进程2─┐ ┌─进程3─┐
+  │私有内存│ │私有内存│ │私有内存│
+  └───┬───┘ └───┬───┘ └───┬───┘
+      └─────────┼─────────┘
+            ┌────┴─────┐
+            │mmap共享区│ ← smalloc 分配的全局状态
+            │(统计/配置)│   进程间通过共享内存通信
+            └──────────┘
+  ★ 天然隔离 + 可控共享
+```
+
+#### 原因 5：I/O 库线程安全性
+
+```
+不是所有引擎/库都线程安全：
+  进程模式：fork 出独立状态 → 无竞争
+  线程模式：共享库状态 → 可能竞争/崩溃
+  ★ 某些引擎必须 --thread（如 SPDK 用 TLS 解决线程安全）
+```
+
+#### 原因 6：信号处理简单
+
+```
+进程模式：每个进程独立信号处理 → SIGINT 干净退出
+线程模式：信号发给哪个线程？复杂
+```
+
+#### 完整对比
+
+| 因素 | 进程模式（默认） | 线程模式 |
+|------|----------------|---------|
+| 崩溃隔离 | ★ 是 | ✗ |
+| 内存损坏隔离 | ★ verify 关键 | ✗ |
+| 库线程安全要求 | ★ 不要求 | 要求 |
+| 信号处理 | ★ 简单 | 复杂 |
+| PSHARED 依赖 | ★ 需要 | 不需要 |
+| TLS 支持 | ✗ | ★ 有（SPDK） |
+| 创建开销 | 高 | 低 |
+
+**一句话总结：** fio 默认进程模式的原因：崩溃隔离、verify 内存损坏隔离、PSHARED 共享内存 IPC 架构、库线程安全性要求低、信号处理简单。线程模式是 PSHARED 不可用或引擎需 TLS（SPDK）时的选择。
 
 ---
 
