@@ -21,6 +21,7 @@
 - [Q13: fio 的线程模式是什么？默认是什么？为什么 SPDK 需要 --thread？](#q13-fio-的线程模式是什么默认是什么为什么-spdk-需要---thread)
 - [Q14: 为什么 fio 默认进程模式？线程模式看起来没坏处](#q14-为什么-fio-默认进程模式线程模式看起来没坏处)
 - [Q15: 如何用 IO depth 分布诊断瓶颈？](#q15-如何用-io-depth-分布诊断瓶颈)
+- [Q16: stonewall 的作用？如何设置 task 并行/串行？每个 task 能多 job 吗？](#q16-stonewall-的作用如何设置-task-并行串行每个-task-能多-job-吗)
 
 ---
 
@@ -1459,6 +1460,127 @@ Step 3: 对比不同 iodepth 的 IOPS 找拐点
 | complete | 收割正常 | 有 0→收割不及时 | 收割效率 |
 
 **一句话总结：** IO depths 看实际并发度（高=设备瓶颈，低=提交瓶颈），submit 看提交效率（有 0=应用慢），complete 看收割效率（有 0=收割不及时）。三者组合精确定位瓶颈在设备还是 CPU。
+
+---
+
+## Q16: stonewall 的作用？如何设置 task 并行/串行？每个 task 能多 job 吗？
+
+**日期：** 2026-07-04  
+**场景：** 需要让多个 fio job 按特定顺序运行  
+**相关文件：** `docs/fio/reading/10_command_reference.md`  
+**源码位置：** `src/fio/options.c:4881`、`src/fio/backend.c:2773`、`src/fio/init.c:1965`
+
+### 回答
+
+**stonewall = "等之前的 job 全部跑完，再开始这个 job"。默认所有 job 并行。numjobs 让单个 task 内多 job 并发。**
+
+#### stonewall 源码
+
+```c
+// options.c:4881
+{
+    .name  = "stonewall",
+    .alias = "wait_for_previous",           // ★ 别名说明一切
+    .help  = "Insert a hard barrier between this job and previous",
+}
+
+// backend.c:2773 — 执行时检查
+if (td->o.stonewall && (nr_started || nr_running)) {
+    break;    // ★ 有 job 在跑 → 暂停，等它们完成
+}
+```
+
+#### 默认（并行） vs stonewall（串行）
+
+```
+默认（无 stonewall）— 并行：
+  Job A: ████████████████
+  Job B: ████████████████     ← 同时启动
+  Job C: ████████████████
+
+stonewall（B 和 C 上设置）— 串行：
+  Job A: ████████████
+  Job B:               ████████████        ← 等 A 完成
+  Job C:                              ████████████  ← 等 B 完成
+```
+
+#### 设置两个 task 并行
+
+```ini
+[task1]
+ioengine=libaio
+rw=randwrite
+filename=/dev/vdb
+size=1G
+# 无 stonewall → 并行
+
+[task2]
+ioengine=libaio
+rw=randread
+filename=/dev/vdc
+size=1G
+# 无 stonewall → 并行
+```
+
+#### 设置两个 task 串行
+
+```ini
+[task1]
+...
+# 无 stonewall（第一个）
+
+[task2]
+...
+stonewall              # ★ 等 task1 完成后才开始
+```
+
+#### 每个 task 可以多 job（numjobs）
+
+```ini
+[task1]
+ioengine=libaio
+numjobs=4              # ★ 4 个相同子 job 并行
+stonewall
+
+[task2]
+numjobs=2              # ★ 2 个相同子 job 并行
+```
+
+源码处理 numjobs（init.c:1965）：
+
+```c
+numjobs = o->numjobs;
+while (--numjobs) {
+    td_new = get_new_job(false, td, true, jobname);
+    td_new->o.numjobs = 1;          // 子 job numjobs=1
+    td_new->o.stonewall = 0;        // ★ 子 job 清除 stonewall（不重复屏障）
+}
+```
+
+#### numjobs + stonewall 组合效果
+
+```
+[task1] numjobs=4 stonewall：
+  task1.1: ████████████
+  task1.2: ████████████    ← 4 个子 job 并行
+  task1.3: ████████████
+  task1.4: ████████████
+                          ← stonewall 屏障，全部完成后
+[task2] numjobs=2：
+  task2.1:               ████████
+  task2.2:               ████████    ← 2 个子 job 并行
+```
+
+#### 速查表
+
+| 需求 | 设置 | 效果 |
+|------|------|------|
+| 两 task 并行 | 都不加 stonewall | 同时启动 |
+| 两 task 串行 | 第二个加 stonewall | 依次运行 |
+| task 内多 job 并发 | numjobs=N | N 个相同子 job 并行 |
+| 阶段内并发+阶段间串行 | stonewall + numjobs | N 个并行子 job，完成后下一阶段 |
+
+**一句话总结：** stonewall 在 job 间插屏障（串行），默认并行，numjobs 让单 task 多 job 并发。组合 `stonewall + numjobs` 实现"阶段内多 job 并发，阶段间串行"。
 
 ---
 
