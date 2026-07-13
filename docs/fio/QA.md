@@ -22,6 +22,7 @@
 - [Q14: 为什么 fio 默认进程模式？线程模式看起来没坏处](#q14-为什么-fio-默认进程模式线程模式看起来没坏处)
 - [Q15: 如何用 IO depth 分布诊断瓶颈？](#q15-如何用-io-depth-分布诊断瓶颈)
 - [Q16: stonewall 的作用？如何设置 task 并行/串行？每个 task 能多 job 吗？](#q16-stonewall-的作用如何设置-task-并行串行每个-task-能多-job-吗)
+- [Q17: fio 的 slat/clat 与 blktrace 的 Q2D/D2C 真的对应吗？](#q17-fio-的-slatclat-与-blktrace-的-q2dd2c-真的对应吗)
 
 ---
 
@@ -1581,6 +1582,120 @@ while (--numjobs) {
 | 阶段内并发+阶段间串行 | stonewall + numjobs | N 个并行子 job，完成后下一阶段 |
 
 **一句话总结：** stonewall 在 job 间插屏障（串行），默认并行，numjobs 让单 task 多 job 并发。组合 `stonewall + numjobs` 实现"阶段内多 job 并发，阶段间串行"。
+
+---
+
+## Q17: fio 的 slat/clat 与 blktrace 的 Q2D/D2C 真的对应吗？
+
+**日期：** 2026-07-04  
+**场景：** 质疑"fio slat ≈ blktrace Q2D, fio clat ≈ blktrace D2C"的对应关系  
+**相关文件：** `docs/fio/reading/10_command_reference.md`  
+**源码位置：** `src/fio/stat.c:3498`（slat）、`src/fio/io_u.c:2097`（clat）、`src/fio/ioengines.c:376`（issue_time）
+
+### 回答
+
+**不对应。blktrace 只看内核 block layer（Q→D→C），fio 还包含用户态准备（slat）和 io_submit/AIO/io_getevents 开销。**
+
+#### fio 三个时间点（源码）
+
+```c
+// start_time（io_u.c:2011）— io_u 开始准备
+fio_gettime(&io_u->start_time, NULL);
+
+// issue_time（ioengines.c:376）— 即将调用 engine->queue()（io_submit）
+fio_gettime(&io_u->issue_time, NULL);
+
+// completion_time（io_u.c:2097）— io_getevents 收割完成
+llnsec = ntime_since(&io_u->issue_time, &icd->time);
+
+// slat = issue_time - start_time（stat.c:3498）
+nsec = ntime_since(&io_u->start_time, &io_u->issue_time);
+
+// clat = completion - issue（io_u.c:2097）
+```
+
+#### 完整时间线
+
+```
+fio 用户态                    内核                    设备
+──────────                   ──────                  ──────
+start_time ─┐
+            │ ① 用户态准备
+            │   get_io_u/offset/buffer/prep
+issue_time ─┤ ② io_submit() 系统调用 ← 用户态→内核态
+            │ ③ 内核 AIO（sys_io_submit/aio_run_iocb）
+            │   submit_bio() ──── ★ blktrace Q 事件
+            │ ④ block layer（调度器排队/合并）
+            │   ──────────────── ★ blktrace D 事件
+            │ ⑤ 下发到设备 ──────────────────  ⑥ 设备处理
+            │   ─────────────────────────────  ─────────────
+            │   ────────────────────────────── ★ blktrace C 事件
+            │ ⑦ 中断回调 + io_getevents 收割 ← 内核→用户态
+completion ─┘ ⑧ fio 收到完成
+
+fio slat = ① 用户态准备
+fio clat = ②~⑧（io_submit + AIO内核 + Q2C + io_getevents）
+fio lat  = ①~⑧
+
+blktrace Q2D = ④ block layer
+blktrace D2C = ⑤⑥⑦ 设备+中断
+blktrace Q2C = ④⑤⑥⑦
+```
+
+#### 两个对应关系的错误
+
+**错误 1：fio slat ≈ blktrace Q2D ❌**
+```
+fio slat     = ① 用户态准备（io_submit 之前，纯用户态）
+blktrace Q2D = ④ block layer（submit_bio 之后，纯内核）
+★ 完全不同阶段！slat 在内核前，Q2D 在内核中
+```
+
+**错误 2：fio clat ≈ blktrace D2C ❌**
+```
+fio clat     = ②③④⑤⑥⑦⑧（io_submit+AIO+Q2C+io_getevents）
+blktrace D2C = ⑤⑥⑦（设备+中断）
+★ clat 远大于 D2C，包含系统调用+AIO+Q2D+io_getevents 开销
+```
+
+#### 正确关系
+
+```
+fio clat = blktrace Q2C + io_submit开销 + AIO内核开销 + io_getevents开销
+fio slat = blktrace 完全看不到的用户态准备时间
+fio lat  = slat + clat（包含 blktrace 看不到的部分）
+
+★ Q2C ⊂ clat（Q2C 是 clat 的子集）
+```
+
+#### 实际差异示例
+
+```
+NVMe 4K 随机写 iodepth=1：
+  fio:  slat=5μs  clat=90μs  lat=95μs
+  btt:  Q2D=2μs   D2C=80μs   Q2C=82μs
+
+  fio clat(90) - btt Q2C(82) = 8μs
+  ↑ 8μs = io_submit系统调用 + AIO内核 + io_getevents 开销
+  
+  fio slat(5μs) = btt 完全看不到的用户态时间
+```
+
+#### btt 的真正价值
+
+```
+从 fio clat 中拆分出：
+  Q2D = block layer 延迟 → 调度器是否瓶颈
+  D2C = 设备延迟 → 硬件是否瓶颈
+
+btt 看不到的：
+  ★ 用户态 slat（offset 计算、buffer 填充）
+  ★ io_submit 系统调用开销
+  ★ 内核 AIO 子系统开销
+  ★ io_getevents 收割开销
+```
+
+**一句话总结：** blktrace 只看内核 block layer（Q→D→C），fio 还包含用户态 slat + io_submit/AIO/io_getevents 开销。fio slat ≠ Q2D（不同阶段），fio clat ≠ D2C（clat 远大于 D2C）。btt 从 clat 中拆出 Q2D/D2C，但看不到用户态和系统调用开销。
 
 ---
 

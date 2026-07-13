@@ -528,7 +528,20 @@ btt -i trace.bin -o summary
 # 对比 fio 报告的延迟和 btt 报告的延迟
 ```
 
-**用途：** fio 报告的是端到端延迟（slat + clat），btt 可以拆分出 Q2D（软件延迟）和 D2C（设备延迟）。
+**用途：** ★ 注意 fio 和 blktrace 的延迟**不完全对应**——blktrace 只看内核 block layer（Q→D→C），fio 还包含用户态准备（slat）和 io_submit/AIO/io_getevents 开销。详见 QA Q17 和下方对照。
+
+```
+fio lat  = 用户态准备 + io_submit + AIO内核 + blktrace Q2C + io_getevents
+fio slat = 用户态准备（blktrace 完全看不到）
+fio clat = io_submit + AIO内核 + Q2C + io_getevents（★ clat > Q2C，包含系统调用开销）
+
+btt 拆分：
+  Q2D = block layer 延迟（调度器是否瓶颈）— fio 看不到的内核细节
+  D2C = 设备延迟（硬件是否瓶颈）
+  Q2C = block layer + 设备（clat 的子集）
+
+★ btt 看不到的：用户态 slat + io_submit/AIO/io_getevents 开销
+```
 
 ### 场景 7：数据验证模式
 
@@ -655,10 +668,17 @@ blktrace 的延迟模型：
   │←───────── Q2D ────────────→│
   │←────────────── Q2C ────────────────────→│
 
-对应关系（大致）：
-  fio slat ≈ blktrace Q2D  （软件层延迟）
-  fio clat ≈ blktrace D2C  （设备层延迟）
-  fio lat  ≈ blktrace Q2C  （端到端延迟）
+对应关系（★ 不精确，有重叠/缺口）：
+  fio slat     = 用户态准备（io_submit 之前，blktrace 完全看不到）
+  blktrace Q2D = block layer（submit_bio 之后，fio slat 之后的阶段）
+  fio clat     = io_submit + AIO内核 + Q2D + D2C + io_getevents（★ 包含 Q2C 但更大）
+  blktrace D2C = 设备+中断（clat 的子集）
+  fio lat      = slat + clat（★ > Q2C，包含用户态+系统调用开销）
+
+★ 精确关系：
+  fio clat = blktrace Q2C + (io_submit + AIO + io_getevents 开销)
+  fio lat  = slat + clat > blktrace Q2C
+  典型差异：clat - Q2C ≈ 5-15μs（系统调用+AIO+io_getevents 开销）
 ```
 
 ### 百分位延迟
@@ -756,14 +776,17 @@ src/fio/blktrace.c 主要函数：
 
 ### fio 延迟 vs blktrace/btt 延迟对比
 
-| fio 指标 | blktrace/btt 指标 | 含义 |
-|---------|------------------|------|
-| `slat`（提交延迟） | `Q2D`（大致） | 从 fio 提交到内核接受 |
-| `clat`（完成延迟） | `D2C`（大致） | 从内核接受到设备完成 |
-| `lat`（总延迟） | `Q2C`（大致） | 端到端延迟 |
+| fio 指标 | blktrace/btt 指标 | 精确关系 |
+|---------|------------------|---------|
+| `slat`（提交延迟） | 无对应 | ★ slat=用户态准备（offset/buffer/prep），blktrace 完全看不到 |
+| `clat`（完成延迟） | `Q2C` 的超集 | ★ clat = Q2C + io_submit + AIO + io_getevents 开销 |
+| `lat`（总延迟） | `Q2C` 的超集 | ★ lat = slat + clat > Q2C |
 
-**注意：** 这是大致对应关系。fio 的 slat 测量的是 engine->queue() 返回的时间，
-而 blktrace 的 Q2D 包含 Q→G→I→D 全部阶段。差异取决于引擎实现。
+**★ 关键纠正（详见 QA Q17）：**
+- fio slat ≠ blktrace Q2D：slat 是 io_submit **之前**的用户态准备，Q2D 是 submit_bio **之后**的内核 block layer
+- fio clat ≠ blktrace D2C：clat = io_submit+AIO+Q2D+D2C+io_getevents，远大于 D2C
+- 典型差异：fio clat - btt Q2C ≈ 5-15μs（系统调用+AIO+io_getevents 开销）
+- btt 的价值：从 clat 中拆出 Q2D（调度器瓶颈）和 D2C（设备瓶颈），但看不到用户态 slat
 
 ---
 
