@@ -20,6 +20,7 @@
 - [Q12: sync 引擎的 .prep 何时调用？能否通过多 job/多 qd 实现并发？](#q12-sync-引擎的-prep-何时调用能否通过多-job多-qd-实现并发)
 - [Q13: fio 的线程模式是什么？默认是什么？为什么 SPDK 需要 --thread？](#q13-fio-的线程模式是什么默认是什么为什么-spdk-需要---thread)
 - [Q14: 为什么 fio 默认进程模式？线程模式看起来没坏处](#q14-为什么-fio-默认进程模式线程模式看起来没坏处)
+- [Q15: 如何用 IO depth 分布诊断瓶颈？](#q15-如何用-io-depth-分布诊断瓶颈)
 
 ---
 
@@ -1315,6 +1316,134 @@ ptr = mmap(NULL, alloc_size, PROT_READ|PROT_WRITE,
 | 创建开销 | 高 | 低 |
 
 **一句话总结：** fio 默认进程模式的原因：崩溃隔离、verify 内存损坏隔离、PSHARED 共享内存 IPC 架构、库线程安全性要求低、信号处理简单。线程模式是 PSHARED 不可用或引擎需 TLS（SPDK）时的选择。
+
+---
+
+## Q15: 如何用 IO depth 分布诊断瓶颈？
+
+**日期：** 2026-07-04  
+**场景：** 阅读 fio 输出中的 IO depths / submit / complete 分布，想用它判断瓶颈是否合理  
+**相关文件：** `docs/fio/reading/09_stat_output.md`  
+**源码位置：** `src/fio/io_u.c:1188-1224`、`src/fio/stat.c:1825`
+
+### 回答
+
+**三种分布分别看提交效率、实际并发度、收割效率，组合判断瓶颈在设备还是 CPU。**
+
+#### 三种分布的源码
+
+```c
+// io_u.c:1200 — IO depths：记录采样时的 cur_depth（在飞数）
+void io_u_mark_depth(struct thread_data *td, unsigned int nr)
+{
+    switch (td->cur_depth) {     // ★ 当前在飞 I/O 数
+    case 1:         idx = 0;    // 桶：1
+    case 2 ... 3:   idx = 1;    // 桶：2-3
+    case 4 ... 7:   idx = 2;    // 桶：4-7
+    case 8 ... 15:  idx = 3;    // 桶：8-15
+    case 16 ... 31: idx = 4;    // 桶：16-31
+    case 32 ... 63: idx = 5;    // 桶：32-63
+    default:        idx = 6;    // 桶：>=64
+    }
+    td->ts.io_u_depth[idx]++;
+}
+
+// io_u.c:1188 — submit：每次 commit 提交了几个 I/O
+void io_u_mark_submit(struct thread_data *td, unsigned int nr) {
+    __io_u_mark_map(td->ts.io_u_submit, nr);  // nr = 本次提交数
+}
+
+// io_u.c:1194 — complete：每次收割了几个完成事件
+void io_u_mark_complete(struct thread_data *td, unsigned int nr) {
+    __io_u_mark_map(td->ts.io_u_complete, nr);  // nr = 本次收割数
+}
+```
+
+#### 三种分布的诊断维度
+
+```
+  提交侧              在飞                收割侧
+┌──────────┐    ┌──────────┐    ┌──────────┐
+│ submit   │→→→│ IO depths│→→→│ complete │
+│ 每次     │    │ 运行期间 │    │ 每次     │
+│ commit   │    │ 在飞几个 │    │ reap     │
+│ 提交几个 │    │          │    │ 收割几个 │
+└──────────┘    └──────────┘    └──────────┘
+   提交效率        实际并发度       收割效率
+```
+
+#### 瓶颈诊断矩阵（5 种场景）
+
+**场景 1：理想（均衡）**
+```
+IO depths : 32=99.8%
+submit    : 32=100%
+complete  : 32=100%
+→ iodepth 充分利用，设备与提交匹配
+```
+
+**场景 2：★ 设备瓶颈（队列满）**
+```
+IO depths : 32=99.5%       ← 队列总是满的 → 设备是瓶颈
+submit    : 32=100%        ← 提交很快（CPU 不是瓶颈）
+complete  : 4=30%,8=40%    ← 分散，设备完成不均匀
+→ 优化：增大 iodepth 或换更快设备
+```
+
+**场景 3：★ 提交瓶颈（队列不满）**
+```
+IO depths : 1=60%,2=20%    ← 大部分时间只有 1 个在飞 → 提交跟不上
+submit    : 0=50%          ← 50% 时没有 I/O 可提交！
+complete  : 4=90%          ← 设备很快完成
+→ 瓶颈在 CPU/应用（offset 计算慢/单线程提交）
+→ 优化：检查 random_generator、调 iodepth_batch_submit、--numjobs
+```
+
+**场景 4：★ 收割瓶颈**
+```
+IO depths : 32=95%         ← 队列满
+submit    : 32=100%        ← 提交正常
+complete  : 0=80%          ← ★ 80% 收割了 0 个！io_getevents 超时
+→ 收割循环空转
+→ 优化：调 iodepth_batch_complete 参数
+```
+
+**场景 5：iodepth 过大**
+```
+IO depths : >=64=100%      ← 全在 64+ 桶
+IOPS: iodepth=64 和 128 几乎相同 ← 已饱和
+延迟: iodepth=128 比 64 翻倍 ← 排队效应
+→ 优化：降到 IOPS 拐点
+```
+
+#### 实战诊断流程
+
+```
+Step 1: 看 IO depths
+  ├─ 高深度占 >90% → 队列满 → 设备瓶颈 → 看 complete
+  └─ 低深度占 >50% → 队列不满 → 提交瓶颈 → 看 submit
+
+Step 2a（设备瓶颈）：complete 分散 = 正常
+Step 2b（提交瓶颈）：submit 有 0 = 应用慢
+
+Step 3: 对比不同 iodepth 的 IOPS 找拐点
+  iodepth=1:  50K, 0.02ms
+  iodepth=4:  150K, 0.03ms  ← 线性
+  iodepth=16: 300K, 0.05ms  ← 放缓
+  iodepth=32: 320K, 0.10ms  ← ★ 拐点
+  iodepth=64: 325K, 0.20ms  ← 过了拐点
+  → 最佳 iodepth = 32
+```
+
+#### 速查表
+
+| 分布 | 高深度/大数 | 低深度/有 0 | 含义 |
+|------|------------|------------|------|
+| IO depths | 队列满→设备瓶颈 | 队列空→提交瓶颈 | 实际并发度 |
+| submit | 提交正常 | 有 0→应用慢 | 提交效率 |
+| complete | 收割正常 | 有 0→收割不及时 | 收割效率 |
+
+**一句话总结：** IO depths 看实际并发度（高=设备瓶颈，低=提交瓶颈），submit 看提交效率（有 0=应用慢），complete 看收割效率（有 0=收割不及时）。三者组合精确定位瓶颈在设备还是 CPU。
 
 ---
 
