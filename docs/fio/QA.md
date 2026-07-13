@@ -18,6 +18,7 @@
 - [Q10: get_next_offset 中 offset 为什么不能大于 io_size？](#q10-get_next_offset-中-offset-为什么不能大于-io_size)
 - [Q11: fio 中的"文件"是什么含义？能否直接对裸设备读写？](#q11-fio-中的文件是什么含义能否直接对裸设备读写)
 - [Q12: sync 引擎的 .prep 何时调用？能否通过多 job/多 qd 实现并发？](#q12-sync-引擎的-prep-何时调用能否通过多-job多-qd-实现并发)
+- [Q13: fio 的线程模式是什么？默认是什么？为什么 SPDK 需要 --thread？](#q13-fio-的线程模式是什么默认是什么为什么-spdk-需要---thread)
 
 ---
 
@@ -1105,6 +1106,111 @@ fio --ioengine=libaio --iodepth=32 --direct=1 --filename=/dev/vdb
 ```
 
 **一句话总结：** `.prep` 在 queue 前调用（sync 做 lseek）。sync 引擎用 `--numjobs` 实现并发（多进程），不能用 `--iodepth`（queue 阻塞返回 COMPLETED，fio 强制 qd=1）。
+
+---
+
+## Q13: fio 的线程模式是什么？默认是什么？为什么 SPDK 需要 --thread？
+
+**日期：** 2026-07-04  
+**场景：** 阅读 `08_engine_spdk.md` 中 SPDK 要求 `--thread`，不理解线程模式  
+**相关文件：** `docs/fio/reading/08_engine_spdk.md`  
+**源码位置：** `src/fio/options.c` — `--thread` 选项；`src/fio/backend.c:2802`
+
+### 回答
+
+**fio 默认是进程模式（fork），`--thread` 切换为线程模式（pthread_create）。SPDK 依赖线程局部存储（TLS），所以必须用 `--thread`。**
+
+#### 选项定义与默认值
+
+```c
+// options.c — --thread 选项
+{
+    .name = "thread",
+    .type = FIO_OPT_STR_SET,           // STR_SET = 默认 0（关闭）
+    .help = "Use threads instead of processes",
+#ifdef CONFIG_NO_SHM
+    .def = "1",                        // 只有无共享内存时默认 1
+#endif
+}
+// ★ Linux 上默认 use_thread=0（进程模式）
+```
+
+#### 两种创建方式
+
+```c
+// backend.c:2802
+if (td->o.use_thread) {
+    pthread_create(&td->thread, NULL, thread_main, fd);  // ★ 线程
+} else {
+    pid = fork();                                         // ★ 进程
+    if (!pid) thread_main(fd);
+}
+
+// backend.c:1964 — thread_main 中设置 PID
+if (!o->use_thread)
+    td->pid = getpid();    // 进程模式：独立 PID
+else
+    td->pid = gettid();    // 线程模式：线程 ID
+```
+
+#### 进程模式 vs 线程模式
+
+```
+进程模式（默认）：
+  ┌─ 进程1 (PID=1001) ─┐  ┌─ 进程2 (PID=1002) ─┐
+  │ 独立地址空间         │  │ 独立地址空间         │
+  │ 独立 fd 表          │  │ 独立 fd 表          │
+  │ 独立内存            │  │ 独立内存            │
+  └────────────────────┘  └────────────────────┘
+  ★ 内存隔离，更安全；共享需 mmap(MAP_SHARED)
+
+线程模式（--thread）：
+  ┌─ 进程 (PID=2000) ─────────────────────┐
+  │ ┌─ 线程1 (TID=2000) ─┐                │
+  │ │ 共享地址空间         │                │
+  │ ├─ 线程2 (TID=2001) ─┤  ← 共享一切    │
+  │ │ 共享 fd/内存        │                │
+  │ └────────────────────┘                │
+  └────────────────────────────────────────┘
+  ★ 共享地址空间、fd、内存；支持 TLS
+```
+
+#### 为什么 SPDK 需要 --thread
+
+```
+SPDK（Storage Performance Development Kit）使用线程局部存储（TLS）：
+  - SPDK 的 per-thread 状态（I/O 通道、poller）存储在 TLS 中
+  - fork() 后子进程不继承父进程的 TLS 初始化状态
+  - pthread_create() 会正确初始化 TLS
+
+  → SPDK 的 bdev 层、NVMe 驱动假设运行在线程中
+  → 进程模式（fork）下 TLS 数据丢失 → 崩溃
+  → 必须用 --thread
+```
+
+#### 性能对比
+
+| 特性 | 进程模式（默认） | 线程模式 |
+|------|----------------|---------|
+| 创建开销 | 高（fork 复制页表） | 低（pthread_create） |
+| 内存共享 | 否 | 是 |
+| TLS 支持 | ✗ | ★ 是（SPDK 需要） |
+| 崩溃影响 | 独立 | 整个进程退出 |
+
+#### 实际使用
+
+```bash
+# 默认进程模式
+fio --name=test --numjobs=4 --filename=/dev/vdb    # 4 个独立进程
+
+# 线程模式
+fio --name=test --numjobs=4 --thread --filename=/dev/vdb    # 4 个线程
+
+# SPDK 必须 --thread
+fio --ioengine=spdk_bdev --thread --filename=Bdev0 ...
+```
+
+**一句话总结：** fio 默认进程模式（fork），`--thread` 切换线程模式。SPDK 依赖 TLS（线程局部存储），fork 不继承 TLS 初始化，所以必须用 `--thread`。
 
 ---
 
